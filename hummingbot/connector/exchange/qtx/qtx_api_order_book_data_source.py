@@ -1,7 +1,9 @@
 import asyncio
+import socket
+import struct
 import time
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from hummingbot.connector.exchange.qtx import qtx_constants as CONSTANTS, qtx_utils, qtx_web_utils as web_utils
 from hummingbot.connector.exchange.qtx.qtx_order_book import QTXOrderBook
@@ -9,10 +11,10 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase, TokenAmount
-from hummingbot.core.event.events import MarketEvent, OrderFilledEvent # For triggering events
-from hummingbot.core.web_assistant.ws_assistant import WSAssistant # <<< Import Added
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
+from hummingbot.core.event.events import MarketEvent, OrderFilledEvent  # For triggering events
 from hummingbot.core.utils.async_utils import safe_gather  # Add import for safe_gather
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant  # <<< Import Added
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
@@ -40,39 +42,67 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         
         # Set the order book create function to use QTXOrderBook
         self._order_book_create_function = lambda: QTXOrderBook()
-        self.logger().info("QTX API Order Book Data Source initialized")
+        
+        # UDP connection settings
+        self._qtx_host = self._connector._qtx_host
+        self._qtx_port = self._connector._qtx_port
+        self._socket = None
+        self._last_update_id = {}  # Track update_id by trading pair
+        self._empty_orderbook = {}  # Track empty orderbook snapshots by trading pair
+        
+        # For trading pair mapping
+        self._exchange_trading_pairs = {}  # Map from exchange format to hummingbot format
+        self._subscription_indices = {}  # Map from subscription index to trading pair
+        
+        self.logger().info(f"QTX API Order Book Data Source initialized with UDP host: {self._qtx_host}, port: {self._qtx_port}")
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
-        self.logger().warning("Using static last traded prices for testing.")
-        return {pair: 10000.0 for pair in trading_pairs}
+        """
+        Get last traded prices from the order book snapshots
+        """
+        result = {}
+        for trading_pair in trading_pairs:
+            # Try to get the last trade price from the order book
+            order_book = self._connector.order_book_tracker.order_books.get(trading_pair)
+            if order_book is not None and order_book.last_trade_price is not None:
+                result[trading_pair] = float(order_book.last_trade_price)
+            else:
+                # Default price if no trades yet
+                result[trading_pair] = 0.0
+                
+        return result
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
+        """
+        Create an empty initial snapshot for a trading pair.
+        Real data will be populated through UDP messages.
+        """
         try:
             snapshot_timestamp = time.time()
             update_id = int(snapshot_timestamp * 1000)
 
-            # Create a more complete and realistic snapshot
+            # Create an empty snapshot to be populated later
+            self.logger().info(f"Creating empty initial snapshot for {trading_pair}")
             snapshot_data = {
                 "trading_pair": trading_pair,
                 "update_id": update_id,
-                "bids": [[Decimal("9980.0"), Decimal("3.0")], 
-                         [Decimal("9990.0"), Decimal("2.0")], 
-                         [Decimal("10000.0"), Decimal("1.0")]],  # Multiple bid levels
-                "asks": [[Decimal("10010.0"), Decimal("1.0")], 
-                         [Decimal("10020.0"), Decimal("2.0")], 
-                         [Decimal("10030.0"), Decimal("3.0")]],  # Multiple ask levels
+                "bids": [],  # Empty bids
+                "asks": [],  # Empty asks
             }
+            
+            # Store the empty snapshot for this trading pair
+            self._empty_orderbook[trading_pair] = True
+            self._last_update_id[trading_pair] = update_id
             
             snapshot_msg = QTXOrderBook.snapshot_message_from_exchange(
                 snapshot_data, snapshot_timestamp, metadata={"trading_pair": trading_pair}
             )
-            self.logger().info(f"Generated initial snapshot for {trading_pair}")
             return snapshot_msg
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self.logger().error(f"Error generating static snapshot for {trading_pair}: {str(e)}", exc_info=True)
+            self.logger().error(f"Error generating initial snapshot for {trading_pair}: {str(e)}", exc_info=True)
             return QTXOrderBook.snapshot_message_from_exchange(
                 {"trading_pair": trading_pair, "update_id": int(time.time() * 1000), "bids": [], "asks": []},
                 time.time(), metadata={"trading_pair": trading_pair}
@@ -81,29 +111,275 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # Required methods by base class
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Returns a dummy WSAssistant instance. Not used, but might be required by base tracker logic.
+        Returns a dummy WSAssistant instance. Not used for UDP connection.
         """
-        # <<< Return dummy instance instead of pass
         return WSAssistant(auth=None, api_factory=None)
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
-        Not used in this implementation. Pass to satisfy interface.
+        Not used in UDP implementation. Pass to satisfy interface.
         """
         pass
+    
+    def _convert_to_exchange_trading_pair(self, trading_pair: str) -> str:
+        """
+        Convert Hummingbot trading pair format to QTX format
+        Format: "BTC-USDT" -> "binance:btcusdt"
+        """
+        # For simplicity, default to binance
+        exchange = "binance"
+        
+        # Special cases for common pairs that might be futures
+        if trading_pair.endswith("-PERP"):
+            exchange = "binance-futures"
+            # Remove the -PERP suffix for the pair part
+            pair = trading_pair[:-5].replace("-", "").lower()
+        else:
+            # Regular spot pair
+            pair = trading_pair.replace("-", "").lower()
+        
+        return f"{exchange}:{pair}"
+    
+    def _parse_binary_message(self, data: bytes) -> Optional[Dict[str, Any]]:
+        """
+        Parse binary message from UDP feed based on the format specified in the implementation guide.
+        
+        Binary format includes header with type, index, timestamps, and sequence number.
+        """
+        if not data or len(data) < 40:  # Minimum header size
+            return None
+            
+        try:
+            # Parse the message header (40 bytes)
+            msg_type, index, tx_ms, event_ms, local_ns, sn_id = struct.unpack("<iiqqqq", data[:40])
+            
+            # Get the trading pair from the subscription index
+            trading_pair = self._subscription_indices.get(index)
+            if not trading_pair:
+                self.logger().debug(f"Received message for unknown subscription index: {index}")
+                return None
+            
+            # Process based on message type
+            if abs(msg_type) == 1:  # Ticker (Bid = 1, Ask = -1)
+                return self._parse_ticker_binary(data, trading_pair, msg_type > 0)
+            elif msg_type == 2:  # Depth (Order Book)
+                return self._parse_depth_binary(data, trading_pair)
+            elif abs(msg_type) == 3:  # Trade (Buy = 3, Sell = -3)
+                return self._parse_trade_binary(data, trading_pair, msg_type > 0)
+            else:
+                self.logger().warning(f"Unknown message type: {msg_type}")
+                return None
+        except Exception as e:
+            self.logger().error(f"Error parsing binary message: {e}", exc_info=True)
+            return None
+    
+    def _parse_ticker_binary(self, data: bytes, trading_pair: str, is_bid: bool) -> Optional[Dict[str, Any]]:
+        """
+        Parse ticker data from binary format
+        Used to update best bid/ask but not for order book messages
+        """
+        try:
+            # Extract price and size (offset 40 for start of data after header)
+            price, size = struct.unpack("<dd", data[40:56])
+            
+            # Create ticker message (used to update best bid/ask in memory)
+            timestamp = time.time()
+            update_id = int(timestamp * 1000)
+            
+            # Ensure update_id is always increasing for this trading pair
+            if trading_pair in self._last_update_id:
+                update_id = max(update_id, self._last_update_id[trading_pair] + 1)
+            self._last_update_id[trading_pair] = update_id
+            
+            # For ticker data, create a diff message with single level
+            side = "bid" if is_bid else "ask"
+            msg = {
+                "trading_pair": trading_pair,
+                "update_id": update_id,
+                "timestamp": timestamp,
+                "bids": [[price, size]] if is_bid else [],
+                "asks": [] if is_bid else [[price, size]]
+            }
+            
+            # Log ticker for debugging
+            self.logger().debug(f"Ticker: {side}, {trading_pair}, price: {price}, size: {size}")
+            return msg
+            
+        except Exception as e:
+            self.logger().error(f"Error parsing ticker: {e}", exc_info=True)
+            return None
+    
+    def _parse_depth_binary(self, data: bytes, trading_pair: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse depth (order book) data from binary format
+        This contains full order book information for a symbol
+        """
+        try:
+            # Get ask and bid counts (header is 40 bytes, followed by counts)
+            if len(data) < 56:  # 40 bytes header + 16 bytes counts
+                return None
+                
+            asks_len, bids_len = struct.unpack("<qq", data[40:56])
+            
+            # Extract asks and bids
+            asks = []
+            bids = []
+            offset = 56  # Start after the header and counts
+            
+            # Parse asks
+            for i in range(asks_len):
+                if offset + 16 <= len(data):
+                    price, size = struct.unpack("<dd", data[offset:offset+16])
+                    asks.append([price, size])
+                    offset += 16  # Each price/size pair is 16 bytes
+            
+            # Parse bids
+            for i in range(bids_len):
+                if offset + 16 <= len(data):
+                    price, size = struct.unpack("<dd", data[offset:offset+16])
+                    bids.append([price, size])
+                    offset += 16  # Each price/size pair is 16 bytes
+            
+            # Create message with order book data
+            timestamp = time.time()
+            update_id = int(timestamp * 1000)
+            
+            # Ensure update_id is always increasing for this trading pair
+            if trading_pair in self._last_update_id:
+                update_id = max(update_id, self._last_update_id[trading_pair] + 1)
+            self._last_update_id[trading_pair] = update_id
+            
+            # Sort bids (desc) and asks (asc)
+            bids.sort(key=lambda x: float(x[0]), reverse=True)
+            asks.sort(key=lambda x: float(x[0]))
+            
+            # Create snapshot or diff message based on whether we have an empty order book
+            message_type = "snapshot" if trading_pair in self._empty_orderbook and self._empty_orderbook[trading_pair] else "diff"
+            
+            # If this is the first real data, mark the order book as no longer empty
+            if trading_pair in self._empty_orderbook and self._empty_orderbook[trading_pair]:
+                self._empty_orderbook[trading_pair] = False
+                self.logger().info(f"Received first depth data for {trading_pair}: asks: {len(asks)}, bids: {len(bids)}")
+            
+            msg = {
+                "trading_pair": trading_pair,
+                "update_id": update_id,
+                "timestamp": timestamp,
+                "bids": bids,
+                "asks": asks,
+                "message_type": message_type
+            }
+            
+            self.logger().debug(f"Depth: {trading_pair}, asks: {len(asks)}, bids: {len(bids)}")
+            return msg
+            
+        except Exception as e:
+            self.logger().error(f"Error parsing depth: {e}", exc_info=True)
+            return None
+    
+    def _parse_trade_binary(self, data: bytes, trading_pair: str, is_buy: bool) -> Optional[Dict[str, Any]]:
+        """
+        Parse trade data from binary format
+        """
+        try:
+            # Extract price and size (offset 40 for start of data after header)
+            price, size = struct.unpack("<dd", data[40:56])
+            
+            # Create trade message
+            timestamp = time.time()
+            trade_id = str(int(timestamp * 1000000))  # Use timestamp as trade ID
+            side = "BUY" if is_buy else "SELL"
+            
+            msg = {
+                "trading_pair": trading_pair,
+                "trade_id": trade_id,
+                "price": price,
+                "amount": size,
+                "side": side,
+                "timestamp": timestamp
+            }
+            
+            self.logger().debug(f"Trade: {side}, {trading_pair}, price: {price}, size: {size}")
+            return msg
+            
+        except Exception as e:
+            self.logger().error(f"Error parsing trade: {e}", exc_info=True)
+            return None
+    
+    def _convert_from_exchange_trading_pair(self, exchange_trading_pair: str) -> Optional[str]:
+        """
+        Convert exchange trading pair format to Hummingbot format
+        Format is typically: "exchange:symbol" (e.g., "binance:btcusdt")
+        """
+        try:
+            # Check if we've already converted this pair
+            if exchange_trading_pair in self._exchange_trading_pairs:
+                return self._exchange_trading_pairs[exchange_trading_pair]
+                
+            # Split by colon to get exchange and pair
+            if ":" not in exchange_trading_pair:
+                return None
+                
+            exchange, pair = exchange_trading_pair.split(":")
+            
+            # Special case for futures
+            if exchange == "binance-futures":
+                # Add -PERP suffix for perpetual futures
+                if "btc" in pair.lower() and "usdt" in pair.lower():
+                    result = "BTC-USDT-PERP"
+                elif "eth" in pair.lower() and "usdt" in pair.lower():
+                    result = "ETH-USDT-PERP"
+                else:
+                    # For other futures pairs
+                    for base in ["BTC", "ETH", "BNB", "SOL", "XRP"]:
+                        if base.lower() in pair.lower():
+                            quote = pair.lower().replace(base.lower(), "").upper()
+                            if quote:
+                                result = f"{base}-{quote}-PERP"
+                                break
+                    else:
+                        self.logger().warning(f"Could not convert futures pair: {exchange_trading_pair}")
+                        return None
+            else:
+                # Regular spot pairs
+                if "btc" in pair.lower() and "usdt" in pair.lower():
+                    result = "BTC-USDT"
+                elif "eth" in pair.lower() and "usdt" in pair.lower():
+                    result = "ETH-USDT"
+                elif "eth" in pair.lower() and "btc" in pair.lower():
+                    result = "ETH-BTC"
+                else:
+                    # For other pairs, try a basic conversion
+                    for base in ["BTC", "ETH", "BNB", "SOL", "XRP"]:
+                        if base.lower() in pair.lower():
+                            quote = pair.lower().replace(base.lower(), "").upper()
+                            if quote:
+                                result = f"{base}-{quote}"
+                                break
+                    else:
+                        self.logger().warning(f"Could not convert exchange pair: {exchange_trading_pair}")
+                        return None
+            
+            # Cache the conversion
+            self._exchange_trading_pairs[exchange_trading_pair] = result
+            self.logger().info(f"Mapped {exchange_trading_pair} to {result}")
+            
+            return result
+            
+        except Exception as e:
+            self.logger().error(f"Error converting exchange trading pair: {e}", exc_info=True)
+            return None
 
     async def listen_for_subscriptions(self):
         """
-        Simulates WebSocket subscriptions for market data and generates order book updates.
-        Generates diffs and trades. Initial snapshot is handled by _order_book_snapshot.
+        Connects to the QTX UDP feed, subscribes to trading pairs, and processes incoming market data.
         """
-        self.logger().info("Starting simulated market data generation loop...")
+        self.logger().info(f"Starting UDP connection to {self._qtx_host}:{self._qtx_port}")
         
-        # Ensure message queues exist
+        # Initialize message queues if they don't exist
         if not hasattr(self, "_message_queue"):
             self._message_queue = {}
         
-        # Initialize message queues if they don't exist
         if self._trade_messages_queue_key not in self._message_queue:
             self.logger().info(f"Initializing {self._trade_messages_queue_key} message queue")
             self._message_queue[self._trade_messages_queue_key] = asyncio.Queue()
@@ -116,130 +392,251 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().info(f"Initializing {self._snapshot_messages_queue_key} message queue")
             self._message_queue[self._snapshot_messages_queue_key] = asyncio.Queue()
         
-        # Debug log for trading pairs
-        self.logger().info(f"Generating market data for trading pairs: {self._trading_pairs}")
-        
-        # last_snapshot_timestamp is used for periodic refresh, not initial snapshot
-        last_snapshot_timestamp = 0
-
-        # Generate initial snapshots for order books
+        # Generate initial snapshots (empty) for order books
         try:
-            self.logger().info("Generating initial order book snapshots...")
+            self.logger().info("Generating initial empty order book snapshots...")
             for trading_pair in self._trading_pairs:
+                self._empty_orderbook[trading_pair] = True
                 snapshot_message = await self._order_book_snapshot(trading_pair)
-                self.logger().info(f"Created initial snapshot for {trading_pair}")
+                self.logger().info(f"Created initial empty snapshot for {trading_pair}")
                 self._message_queue[self._snapshot_messages_queue_key].put_nowait(snapshot_message)
-            self.logger().info("Initial snapshots generated successfully")
+            self.logger().info("Initial empty snapshots generated successfully")
         except Exception as e:
             self.logger().error(f"Error generating initial snapshots: {e}", exc_info=True)
-
-        while True:
+        
+        # Create UDP socket
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        try:
+            # Bind to any address on an automatic port for receiving data
+            self._socket.bind(('0.0.0.0', 0))
+            self.logger().info(f"UDP socket created and bound to local port")
+            
+            # Subscribe to symbols
+            self._subscription_indices = {}
+            subscription_success = False
+            
+            for trading_pair in self._trading_pairs:
+                # Convert from Hummingbot format to QTX format
+                qtx_symbol = self._convert_to_exchange_trading_pair(trading_pair)
+                self.logger().info(f"Subscribing to symbol: {qtx_symbol} for {trading_pair}")
+                
+                # Send subscription request
+                self._socket.sendto(qtx_symbol.encode(), (self._qtx_host, self._qtx_port))
+                
+                # Temporarily set socket to blocking to receive response
+                self._socket.setblocking(True)
+                self._socket.settimeout(5.0)  # 5 second timeout
+                
+                try:
+                    # Receive response (index number)
+                    response, _ = self._socket.recvfrom(CONSTANTS.DEFAULT_UDP_BUFFER_SIZE)
+                    if response:
+                        try:
+                            # Parse response (expecting an index number)
+                            index = int(response.decode().strip())
+                            self._subscription_indices[index] = trading_pair
+                            self.logger().info(f"Successfully subscribed to {qtx_symbol} with index {index}")
+                            subscription_success = True
+                        except ValueError as ve:
+                            self.logger().error(f"Invalid response for {qtx_symbol}: {response.decode().strip()}")
+                except socket.timeout:
+                    self.logger().error(f"Timeout while waiting for subscription response for {qtx_symbol}")
+                except Exception as e:
+                    self.logger().error(f"Error subscribing to {qtx_symbol}: {e}")
+            
+            # Set socket back to non-blocking for message handling
+            self._socket.setblocking(False)
+            
+            if not subscription_success:
+                self.logger().error("No successful subscriptions, UDP feed may not work properly")
+            else:
+                self.logger().info(f"Subscribed to {len(self._subscription_indices)} symbols: {self._subscription_indices}")
+            
+            # Start receiving UDP data
             try:
-                # Generate incremental updates (diffs) and trades
-                for trading_pair in self._trading_pairs:
-                    timestamp = time.time()
-                    update_id = int(timestamp * 1000)
-
-                    # Generate bid and ask updates, alternating to simulate real market activity
-                    price_variation = (timestamp % 5)  # Create some price movement
-
-                    # Bid updates
-                    bid_price = 9995.0 + price_variation
-                    bid_size = 1.0 + (timestamp % 1.0)
-
-                    bid_message = {
-                        "msg_type": CONSTANTS.MSG_TYPE_L1_BID,
-                        "event_ms": int(timestamp * 1000),
-                        "sn_id": update_id,
-                        "price": bid_price,
-                        "size": bid_size,
-                        "trading_pair": trading_pair
-                    }
-
-                    # Ask updates
-                    ask_price = 10005.0 + price_variation
-                    ask_size = 1.0 + (timestamp % 0.8)
-
-                    ask_message = {
-                        "msg_type": CONSTANTS.MSG_TYPE_L1_ASK,
-                        "event_ms": int(timestamp * 1000),
-                        "sn_id": update_id + 1, # Ensure unique ID
-                        "price": ask_price,
-                        "size": ask_size,
-                        "trading_pair": trading_pair
-                    }
-
-                    # Send updates to the diff queue
-                    self._message_queue[self._diff_messages_queue_key].put_nowait(bid_message)
-                    self._message_queue[self._diff_messages_queue_key].put_nowait(ask_message)
-
-                    # Occasionally send trade updates
-                    if int(timestamp) % 3 == 0: # Adjusted frequency slightly
-                        is_buy = (int(timestamp) % 6 < 3)
-                        trade_price = bid_price if is_buy else ask_price
-                        trade_size = 0.1 + (timestamp % 0.2)
-                        trade_sn_id = update_id + 2 # Ensure unique ID
-
-                        trade_message = {
-                            "msg_type": CONSTANTS.MSG_TYPE_TRADE_BUY if is_buy else CONSTANTS.MSG_TYPE_TRADE_SELL,
-                            "event_ms": int(timestamp * 1000),
-                            "sn_id": trade_sn_id,
-                            "price": trade_price,
-                            "size": trade_size,
-                            "trading_pair": trading_pair
-                        }
-
-                        await self._parse_trade_message(
-                            trade_message,
-                            self._message_queue[self._trade_messages_queue_key]
-                        )
-                        # Simulate potential fills based on this trade
-                        await self._check_and_simulate_fills(
-                            trading_pair, Decimal(str(trade_price)), Decimal(str(trade_size)),
-                            TradeType.BUY if is_buy else TradeType.SELL,
-                            str(trade_sn_id), timestamp
-                        )
-
-                # Optional: Add a periodic refresh snapshot logic here if needed, maybe less frequently
-                time_for_refresh = (time.time() - last_snapshot_timestamp) > 60 # e.g., every 60s
-                if time_for_refresh:
-                    self.logger().info("Generating periodic refresh snapshots...")
-                    refresh_timestamp = time.time()
-                    refresh_sn_id = int(refresh_timestamp * 1000)
-                    refresh_tasks = []
-                    for trading_pair in self._trading_pairs:
-                        price_base = 10000.0 + ((refresh_timestamp % 20) - 10) # Wider price movement
-                        refresh_snapshot_data = {
-                            "msg_type": 2,
-                            "trading_pair": trading_pair,
-                            "event_ms": int(refresh_timestamp * 1000),
-                            "sn_id": refresh_sn_id,
-                            "bids": [[price_base - 10, 5.0], [price_base - 20, 4.0]],
-                            "asks": [[price_base + 10, 1.0], [price_base + 20, 2.0]]
-                        }
-                        refresh_tasks.append(self._parse_order_book_snapshot_message(
-                            refresh_snapshot_data,
-                            self._message_queue[self._snapshot_messages_queue_key]
-                        ))
+                while True:
+                    try:
+                        # Use asyncio to make UDP reading non-blocking
+                        data = await asyncio.get_event_loop().sock_recv(self._socket, CONSTANTS.DEFAULT_UDP_BUFFER_SIZE)
+                        
+                        # Parse binary message
+                        message = self._parse_binary_message(data)
+                        
+                        if message is not None:
+                            # Route message to appropriate queue based on type
+                            try:
+                                if "trade_id" in message:
+                                    # Process trade message
+                                    trade_msg = QTXOrderBook.trade_message_from_exchange(
+                                        message,
+                                        {"trading_pair": message.get("trading_pair")}
+                                    )
+                                    self._message_queue[self._trade_messages_queue_key].put_nowait(trade_msg)
+                                elif "message_type" in message and message["message_type"] == "snapshot":
+                                    # Process snapshot message
+                                    snapshot_msg = QTXOrderBook.snapshot_message_from_exchange(
+                                        message,
+                                        message.get("timestamp", time.time()),
+                                        {"trading_pair": message.get("trading_pair")}
+                                    )
+                                    self._message_queue[self._snapshot_messages_queue_key].put_nowait(snapshot_msg)
+                                elif "bids" in message or "asks" in message:
+                                    # Process diff message
+                                    diff_msg = QTXOrderBook.diff_message_from_exchange(
+                                        message,
+                                        message.get("timestamp", time.time()),
+                                        {"trading_pair": message.get("trading_pair")}
+                                    )
+                                    self._message_queue[self._diff_messages_queue_key].put_nowait(diff_msg)
+                                else:
+                                    self.logger().debug(f"Received message with no recognized format: {message}")
+                            except Exception as e:
+                                self.logger().error(f"Error routing message: {e}, message: {message}")
                     
-                    # Use safe_gather with properly imported function
-                    if refresh_tasks:
-                        await safe_gather(*refresh_tasks)
-                    
-                    last_snapshot_timestamp = refresh_timestamp
-                    self.logger().info("Periodic refresh snapshots generated.")
-
-
-                # Sleep to control overall loop frequency
-                await asyncio.sleep(0.1) # Adjust sleep as needed for desired update rate
-
+                    except asyncio.CancelledError:
+                        raise
+                    except BlockingIOError:
+                        # No data available, just wait a bit
+                        await asyncio.sleep(0.01)
+                    except Exception as e:
+                        self.logger().error(f"Error in UDP message processing: {e}", exc_info=True)
+                        await asyncio.sleep(0.1)
+                        
             except asyncio.CancelledError:
+                # Unsubscribe from symbols on cancellation
+                for trading_pair in self._trading_pairs:
+                    qtx_symbol = self._convert_to_exchange_trading_pair(trading_pair)
+                    unsubscribe_msg = f"-{qtx_symbol}"
+                    self.logger().info(f"Unsubscribing from symbol: {qtx_symbol}")
+                    self._socket.sendto(unsubscribe_msg.encode(), (self._qtx_host, self._qtx_port))
                 raise
-            except Exception as e:
-                self.logger().error(f"Unexpected error in market data simulation: {e}", exc_info=True)
-                # Reset last refresh timestamp on error
-                last_snapshot_timestamp = 0
-                await asyncio.sleep(5.0) # Wait before retrying after error
+                
+        except asyncio.CancelledError:
+            self.logger().info("UDP listener cancelled")
+            if self._socket is not None:
+                self._socket.close()
+                self._socket = None
+            raise
+        except Exception as e:
+            self.logger().error(f"Unexpected error in UDP listener: {e}", exc_info=True)
+            if self._socket is not None:
+                self._socket.close()
+                self._socket = None
+            raise
+
+    async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
+        """
+        Parse a raw order book snapshot message and put it into the message queue.
+        """
+        # If the message is already an OrderBookMessage, just put it in the queue
+        if isinstance(raw_message, OrderBookMessage):
+            await message_queue.put(raw_message)
+            return
+        
+        # Add validation to ensure raw_message is a dictionary
+        if not isinstance(raw_message, dict):
+            self.logger().error(f"Invalid order book snapshot message format: {type(raw_message)}")
+            return
+            
+        trading_pair = raw_message.get("trading_pair")
+        if trading_pair is None:
+            self.logger().error("Order book snapshot message does not contain a trading pair")
+            return
+
+        timestamp = raw_message.get("timestamp", time.time())
+        update_id = raw_message.get("update_id", int(timestamp * 1000))
+
+        # Create a snapshot message
+        snapshot_msg = QTXOrderBook.snapshot_message_from_exchange(
+            raw_message,
+            timestamp,
+            {"trading_pair": trading_pair}
+        )
+
+        # Put the message in the queue
+        await message_queue.put(snapshot_msg)
+
+    async def _parse_trade_message(self, raw_message, message_queue: asyncio.Queue):
+        """
+        Parse a raw trade message and put it into the message queue.
+        """
+        # If the message is already an OrderBookMessage, just put it in the queue
+        if isinstance(raw_message, OrderBookMessage):
+            await message_queue.put(raw_message)
+            return
+        
+        # Add validation to ensure raw_message is a dictionary
+        if not isinstance(raw_message, dict):
+            self.logger().error(f"Invalid trade message format: {type(raw_message)}")
+            return
+            
+        trading_pair = raw_message.get("trading_pair")
+        if trading_pair is None:
+            self.logger().error("Trade message does not contain a trading pair")
+            return
+
+        timestamp = raw_message.get("timestamp", time.time())
+        
+        # Create a trade message
+        trade_msg = QTXOrderBook.trade_message_from_exchange(
+            raw_message,
+            timestamp,
+            {"trading_pair": trading_pair}
+        )
+
+        # Put the message in the queue
+        await message_queue.put(trade_msg)
+
+    async def _parse_order_book_diff_message(self, raw_message, message_queue: asyncio.Queue):
+        """
+        Parse a raw order book diff message and put it into the message queue.
+        """
+        # If the message is already an OrderBookMessage, just put it in the queue
+        if isinstance(raw_message, OrderBookMessage):
+            await message_queue.put(raw_message)
+            return
+        
+        # Add validation to ensure raw_message is a dictionary
+        if not isinstance(raw_message, dict):
+            self.logger().error(f"Invalid order book diff message format: {type(raw_message)}")
+            return
+        
+        trading_pair = raw_message.get("trading_pair")
+        if trading_pair is None:
+            self.logger().error("Order book diff message does not contain a trading pair")
+            return
+
+        timestamp = raw_message.get("timestamp", time.time())
+        update_id = raw_message.get("update_id", int(timestamp * 1000))
+
+        # Create a diff message
+        diff_msg = QTXOrderBook.diff_message_from_exchange(
+            raw_message,
+            timestamp,
+            {"trading_pair": trading_pair}
+        )
+
+        # Put the message in the queue
+        await message_queue.put(diff_msg)
+
+    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        """
+        Determine which channel a message belongs to based on its content.
+        """
+        if "trade_id" in event_message:
+            return self._trade_messages_queue_key
+        elif event_message.get("message_type") == "snapshot":
+            return self._snapshot_messages_queue_key
+        else:
+            return self._diff_messages_queue_key
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        """
+        Not used for UDP connection, but required by the base class.
+        """
+        self.logger().warning("Order stream interruption handler called, not applicable to UDP")
+        pass
 
     async def _check_and_simulate_fills(self,
                                         trading_pair: str,
@@ -248,217 +645,73 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                         trade_type: TradeType,
                                         trade_id: str,
                                         timestamp: float):
-        # Check if connector has the necessary attributes (might not exist during early init)
-        if not hasattr(self._connector, '_order_tracker') or not hasattr(self._connector, '_mock_orders') or not hasattr(self._connector, '_mock_trades'):
-            self.logger().debug("_order_tracker, _mock_orders or _mock_trades not found on connector. Skipping fill simulation.")
-            return
-
-        # Use items() for safe iteration if dictionary might be modified
-        mock_orders_items = list(self._connector._mock_orders.items())
-
-        for order_id, mock_order in mock_orders_items:
-            # Ensure order is in a fillable state and matches the trading pair
-            if mock_order["state"] not in [OrderState.OPEN, OrderState.PARTIALLY_FILLED] \
-               or mock_order["trading_pair"] != trading_pair:
-                continue
-
-            order_price = mock_order["price"]
-            order_type = mock_order["order_type"]
-            order_trade_type = mock_order["trade_type"]
-            order_remaining_amount = mock_order["amount"] - mock_order["executed_base_amount"]
-
-            # Determine if the trade price crosses the order price
-            should_fill = False
-            # If incoming trade is BUY, check if it crosses resting SELL orders
-            if trade_type == TradeType.BUY and order_trade_type == TradeType.SELL and order_price <= trade_price:
-                 should_fill = True
-            # If incoming trade is SELL, check if it crosses resting BUY orders
-            elif trade_type == TradeType.SELL and order_trade_type == TradeType.BUY and order_price >= trade_price:
-                 should_fill = True
-
-            if should_fill:
-                 # Calculate fill amount: minimum of trade size and remaining order amount
-                 fill_amount = min(trade_size, order_remaining_amount)
-                 if fill_amount <= Decimal("0"): # Ensure fill amount is positive
-                     continue
-
-                 self.logger().info(
-                     f"[MOCK FILL] Simulated {trade_type.name} trade ({trade_size} @ {trade_price}) potential fill against "
-                     f"mock order {mock_order['client_order_id']} ({order_trade_type.name} {order_remaining_amount} @ {order_price}). "
-                     f"Fill amount: {fill_amount}"
-                 )
-
-                 # Update mock order state
-                 mock_order["executed_base_amount"] += fill_amount
-                 mock_order["last_update_timestamp"] = timestamp
-                 if mock_order["executed_base_amount"] >= mock_order["amount"]:
-                     mock_order["state"] = OrderState.FILLED
-                 else:
-                     mock_order["state"] = OrderState.PARTIALLY_FILLED
-
-                 # Create mock fee and trade record
-                 mock_fee = DeductedFromReturnsTradeFee(percent=Decimal("0")) # Zero fees for mock
-                 quote_amount = fill_amount * order_price # Use order price for fill value
-                 mock_trade_record = {
-                    "trade_id": trade_id,
-                    "fee": mock_fee,
-                    "fill_base_amount": fill_amount,
-                    "fill_quote_amount": quote_amount,
-                    "fill_price": order_price, # Fill at the resting order's price
-                    "timestamp": timestamp,
-                 }
-                 self._connector._mock_trades[order_id].append(mock_trade_record) # Add to mock trades list
-
-                 # Trigger Hummingbot OrderFilled event
-                 self._connector.trigger_event(
-                    MarketEvent.OrderFilled,
-                    OrderFilledEvent(
-                         timestamp=timestamp,
-                         order_id=mock_order['client_order_id'], # Use client_order_id for the event
-                         trading_pair=trading_pair,
-                         trade_type=order_trade_type,
-                         order_type=order_type,
-                         price=order_price, # Price from the resting order
-                         amount=fill_amount,
-                         trade_fee=mock_fee,
-                         exchange_trade_id=trade_id # Use the simulated trade ID
-                     )
-                 )
-
-                 # Create and process TradeUpdate for the OrderTracker
-                 trade_update = TradeUpdate(
-                     trade_id=trade_id,
-                     client_order_id=mock_order['client_order_id'],
-                     exchange_order_id=order_id, # Use the internal mock order ID
-                     trading_pair=trading_pair,
-                     fee=mock_fee,
-                     fill_base_amount=fill_amount,
-                     fill_quote_amount=quote_amount,
-                     fill_price=order_price,
-                     fill_timestamp=timestamp,
-                 )
-                 # Use the connector's order tracker instance
-                 self._connector.order_tracker.process_trade_update(trade_update)
-
-                 # If the order is fully filled, process an OrderUpdate
-                 if mock_order["state"] == OrderState.FILLED:
-                     order_update = OrderUpdate(
-                         trading_pair=trading_pair,
-                         update_timestamp=timestamp,
-                         new_state=OrderState.FILLED,
-                         client_order_id=mock_order['client_order_id'],
-                         exchange_order_id=order_id,
-                     )
-                     self._connector.order_tracker.process_order_update(order_update)
-
-                 # Decrease the remaining size of the incoming trade
-                 trade_size -= fill_amount
-                 # If the incoming trade is fully consumed, stop checking against other orders
-                 if trade_size <= Decimal("0"):
-                     break # Exit the inner loop (checking against mock orders)
-
-    async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
         """
-        Parse order book snapshot message from either a dict or an OrderBookMessage
+        Not used for real exchange data.
         """
-        # If already an OrderBookMessage, just pass it through
-        if isinstance(raw_message, OrderBookMessage):
-            message_queue.put_nowait(raw_message)
-            return
-            
-        # Otherwise, treat as a dict and parse normally
-        if isinstance(raw_message, dict):
-            if raw_message.get("msg_type") != 2:
-                self.logger().warning(f"Received non-L2 message in snapshot parser: {raw_message.get('msg_type')}")
-                return
+        pass
 
-            if "trading_pair" not in raw_message:
-                self.logger().warning(f"Snapshot message missing 'trading_pair': {raw_message}")
-                return
+    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Listens to the trade messages in the trade queue.
+        """
+        message_queue = self._message_queue[self._trade_messages_queue_key]
+        while True:
+            try:
+                trade_message = await message_queue.get()
+                
+                # trade_message should already be an OrderBookMessage type from our UDP processing loop
+                if not isinstance(trade_message, OrderBookMessage):
+                    self.logger().error(f"Invalid trade message in queue: {trade_message}")
+                    continue
+                
+                # Forward the message to the output queue
+                output.put_nowait(trade_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Unexpected error in trade message processing: {e}", exc_info=True)
+                await asyncio.sleep(0.5)
 
-            trading_pair = raw_message["trading_pair"]
-            snapshot_timestamp = raw_message.get("event_ms", time.time() * 1000) / 1000
-
-            formatted_message = {
-                "trading_pair": trading_pair,
-                "update_id": raw_message.get("sn_id", int(snapshot_timestamp * 1000)),
-                "bids": raw_message.get("bids", []),
-                "asks": raw_message.get("asks", []),
-            }
-
-            order_book_message = QTXOrderBook.snapshot_message_from_exchange(
-                formatted_message, snapshot_timestamp, {"trading_pair": trading_pair}
-            )
-            message_queue.put_nowait(order_book_message)
-        else:
-            self.logger().warning(f"Received invalid message type in snapshot parser: {type(raw_message)}")
-
-    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "trading_pair" not in raw_message:
-            self.logger().warning(f"Trade message missing 'trading_pair': {raw_message}")
-            return
-
-        trading_pair = raw_message["trading_pair"]
-
-        is_buy = raw_message.get("msg_type") == CONSTANTS.MSG_TYPE_TRADE_BUY
-
-        formatted_message = {
-            "trading_pair": trading_pair,
-            "trade_id": str(raw_message.get("sn_id", int(time.time() * 1000))),
-            "price": raw_message.get("price", 0),
-            "amount": raw_message.get("size", 0),
-            "side": "BUY" if is_buy else "SELL",
-        }
-
-        trade_message = QTXOrderBook.trade_message_from_exchange(formatted_message, {"trading_pair": trading_pair})
-        message_queue.put_nowait(trade_message)
-
-    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "trading_pair" not in raw_message:
-            self.logger().warning(f"Diff message missing 'trading_pair': {raw_message}")
-            return
-
-        trading_pair = raw_message["trading_pair"]
-        timestamp = raw_message.get("event_ms", time.time() * 1000) / 1000
-
-        price = raw_message.get("price", 0)
-        size = raw_message.get("size", 0)
-        msg_type = raw_message.get("msg_type")
-
-        if abs(msg_type) != 1:
-             self.logger().warning(f"Received non-L1 message in diff parser: {msg_type}")
-             return
-
-        is_bid = msg_type == CONSTANTS.MSG_TYPE_L1_BID
-
-        bids = [[price, size]] if is_bid else []
-        asks = [] if is_bid else [[price, size]]
-
-        formatted_message = {
-            "trading_pair": trading_pair,
-            "update_id": raw_message.get("sn_id", int(timestamp * 1000)),
-            "bids": bids,
-            "asks": asks,
-        }
-
-        order_book_message = QTXOrderBook.diff_message_from_exchange(
-            formatted_message, timestamp, {"trading_pair": trading_pair}
-        )
-        message_queue.put_nowait(order_book_message)
-
-    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
-        msg_type = event_message.get("msg_type", 0)
-
-        if abs(msg_type) == 2:
-            return self._snapshot_messages_queue_key
-        elif abs(msg_type) == 3:
-            return self._trade_messages_queue_key
-        elif abs(msg_type) == 1:
-            return self._diff_messages_queue_key
-        else:
-            self.logger().warning(f"Unknown message type in fake data: {msg_type}")
-            return self._diff_messages_queue_key
-
-    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        self.logger().warning("Order stream interrupted (using fake data).")
-        await super()._on_order_stream_interruption(websocket_assistant)
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Listens to the snapshot messages in the snapshot queue.
+        """
+        message_queue = self._message_queue[self._snapshot_messages_queue_key]
+        while True:
+            try:
+                snapshot_message = await message_queue.get()
+                
+                # snapshot_message should already be an OrderBookMessage type from our UDP processing loop
+                if not isinstance(snapshot_message, OrderBookMessage):
+                    self.logger().error(f"Invalid snapshot message in queue: {snapshot_message}")
+                    continue
+                
+                # Forward the message to the output queue
+                output.put_nowait(snapshot_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Unexpected error in snapshot message processing: {e}", exc_info=True)
+                await asyncio.sleep(0.5)
+                
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Listens to the order book diff messages in the diff queue.
+        """
+        message_queue = self._message_queue[self._diff_messages_queue_key]
+        while True:
+            try:
+                diff_message = await message_queue.get()
+                
+                # diff_message should already be an OrderBookMessage type from our UDP processing loop
+                if not isinstance(diff_message, OrderBookMessage):
+                    self.logger().error(f"Invalid diff message in queue: {diff_message}")
+                    continue
+                
+                # Forward the message to the output queue
+                output.put_nowait(diff_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Unexpected error in diff message processing: {e}", exc_info=True)
+                await asyncio.sleep(0.5)
