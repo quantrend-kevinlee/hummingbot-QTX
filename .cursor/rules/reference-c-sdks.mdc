@@ -1,0 +1,584 @@
+---
+description: To understand how we can connect to the source: subscribe symbols through udp first and then get data from the udp/shared memory
+globs: 
+alwaysApply: false
+---
+The flow of my the system that could be replicated by the sdks is:
+1. Use udp to interact with my server to subscribe to the symbols (e.g., BTCUSDT on binanace's futures).
+2. the user could listen to the subscribe symbols either by using the UDP as well or through a shared memory on the server. Of course, if using the shared memory, this custom Hummingbot has to run on the server as well so that both the market data program and the Hummingbot could access the shared memory. The shared memory is the main apporach that I would like to explore, since if shared memory work, using a remote UDP connection would surely work in theory.
+
+The sdk (written in c) is provided below for you reference.
+
+-----------
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <time.h>
+
+#define UDP_SIZE 65536
+#define MAX_SYMBOLS 100
+#define MAX_SYMBOL_LEN 64
+#define SYMBOL_MANAGER "172.30.2.221"
+
+typedef struct
+{
+    char symbol[MAX_SYMBOL_LEN];
+    unsigned int index;
+} Subscription;
+
+typedef struct
+{
+    int socket;
+    char buf[UDP_SIZE];
+    Subscription subscriptions[MAX_SYMBOLS];
+    int subscription_count;
+} SubscriptionManager;
+
+SubscriptionManager manager;
+volatile sig_atomic_t running = 1;
+
+int init_subscription_manager()
+{
+    // 创建 UDP socket
+    manager.socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (manager.socket < 0)
+    {
+        perror("socket creation failed");
+        return -1;
+    }
+
+    // 绑定到任意端口
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = 0; // 让系统自动分配端口
+
+    if (bind(manager.socket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("bind failed");
+        close(manager.socket);
+        return -1;
+    }
+
+    manager.subscription_count = 0;
+    return 0;
+}
+
+int subscribe(const char *symbol)
+{
+    printf("Subscribing to symbol: %s\n", symbol);
+
+    // 发送订阅请求
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8080);
+    inet_pton(AF_INET, SYMBOL_MANAGER, &server_addr.sin_addr);
+
+    if (sendto(manager.socket, symbol, strlen(symbol), 0,
+               (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    {
+        perror("sendto failed");
+        return -1;
+    }
+
+    // 接收响应
+    struct sockaddr_in from_addr;
+    socklen_t from_len = sizeof(from_addr);
+    int len = recvfrom(manager.socket, manager.buf, UDP_SIZE, 0,
+                       (struct sockaddr *)&from_addr, &from_len);
+    if (len < 0)
+    {
+        perror("recvfrom failed");
+        return -1;
+    }
+
+    manager.buf[len] = '\0';
+    unsigned int index;
+    if (sscanf(manager.buf, "%u", &index) == 1)
+    {
+        // 检查是否已经订阅
+        for (int i = 0; i < manager.subscription_count; i++)
+        {
+            if (strcmp(manager.subscriptions[i].symbol, symbol) == 0)
+            {
+                return 0; // 已经订阅过了
+            }
+        }
+
+        // 添加新订阅
+        if (manager.subscription_count < MAX_SYMBOLS)
+        {
+            strncpy(manager.subscriptions[manager.subscription_count].symbol,
+                    symbol, MAX_SYMBOL_LEN - 1);
+            manager.subscriptions[manager.subscription_count].index = index;
+            manager.subscription_count++;
+            printf("Successfully subscribed to %s with index %u\n", symbol, index);
+        }
+    }
+    else
+    {
+        printf("Failed to subscribe to %s: %s\n", symbol, manager.buf);
+        return -1;
+    }
+
+    return 0;
+}
+
+int unsubscribe(const char *symbol)
+{
+    char unsubscribe_msg[MAX_SYMBOL_LEN + 1];
+    snprintf(unsubscribe_msg, sizeof(unsubscribe_msg), "-%s", symbol);
+    printf("Unsubscribing from symbol: %s\n", symbol);
+
+    // 查找订阅
+    int pos = -1;
+    for (int i = 0; i < manager.subscription_count; i++)
+    {
+        if (strcmp(manager.subscriptions[i].symbol, symbol) == 0)
+        {
+            pos = i;
+            break;
+        }
+    }
+
+    if (pos >= 0)
+    {
+        // 发送取消订阅请求
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(8080);
+        inet_pton(AF_INET, SYMBOL_MANAGER, &server_addr.sin_addr);
+
+        if (sendto(manager.socket, unsubscribe_msg, strlen(unsubscribe_msg), 0,
+                   (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+        {
+            perror("sendto failed");
+            return -1;
+        }
+
+        // 接收响应
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        int len = recvfrom(manager.socket, manager.buf, UDP_SIZE, 0,
+                           (struct sockaddr *)&from_addr, &from_len);
+        if (len < 0)
+        {
+            perror("recvfrom failed");
+            return -1;
+        }
+
+        manager.buf[len] = '\0';
+        printf("Unsubscribe response for %s: %s\n", symbol, manager.buf);
+
+        // 移除订阅
+        for (int i = pos; i < manager.subscription_count - 1; i++)
+        {
+            manager.subscriptions[i] = manager.subscriptions[i + 1];
+        }
+        manager.subscription_count--;
+    }
+    else
+    {
+        printf("Symbol %s not found in subscriptions\n", symbol);
+    }
+
+    return 0;
+}
+
+// 取消所有订阅
+int unsubscribe_all()
+{
+    int success = 1;
+    // 保存当前订阅数量，因为 unsubscribe 会修改 subscription_count
+    size_t count = manager.subscription_count;
+
+    // 从后向前遍历以避免数组重排的影响
+    for (int i = count - 1; i >= 0; i--)
+    {
+        if (unsubscribe(manager.subscriptions[i].symbol) != 0)
+        {
+            success = 0;
+        }
+    }
+
+    return success ? 0 : -1;
+}
+
+void print_status()
+{
+    printf("=== Current Status ===\n");
+    printf("Total symbols: %d\n", manager.subscription_count);
+    for (int i = 0; i < manager.subscription_count; i++)
+    {
+        printf("Symbol: %s (index: %u)\n",
+               manager.subscriptions[i].symbol,
+               manager.subscriptions[i].index);
+    }
+    printf("==================\n");
+}
+
+void handle_signal(int sig)
+{
+    unsubscribe_all();
+    running = 0;
+}
+
+--------------
+
+#include "sdk.c"
+
+typedef struct Msg
+{
+    // 1: L1 Bid, -1: L1 Ask, 2: L2 Bid, -2: L2 Ask, 3: Buy Trade, -3: Sell Trade
+    int msg_type;
+    // Index of symbol
+    int index;
+    // Transaction Time MS
+    long tx_ms;
+    // Event Time MS
+    long event_ms;
+    // Local Time NS
+    long local_ns;
+    // Sequence Number / Trade ID
+    long sn_id;
+    // Price
+    double price;
+    // Size
+    double size;
+} Msg;
+
+typedef struct Msg2
+{
+    // 1: L1 Bid, -1: L1 Ask, 2: L2 Bid, -2: L2 Ask, 3: Buy Trade, -3: Sell Trade
+    int msg_type;
+    // Index of symbol
+    int index;
+    // Transaction Time MS
+    long tx_ms;
+    // Event Time MS
+    long event_ms;
+    // Local Time NS
+    long local_ns;
+    // Sequence Number / Trade ID
+    long sn_id;
+    // Number of asks
+    size_t asks_len;
+    // Number of bids
+    size_t bids_len;
+} Msg2;
+
+typedef struct
+{
+    double price;
+    double size;
+} Msg2Level;
+
+long long get_current_timestamp_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+int main()
+{
+    if (init_subscription_manager() < 0)
+    {
+        return 1;
+    }
+
+    // 订阅默认的 symbols
+    const char *default_symbols[] = {
+        "binance-futures:btcusdt",
+        "binance:btcusdt"};
+    for (int i = 0; i < sizeof(default_symbols) / sizeof(default_symbols[0]); i++)
+    {
+        if (subscribe(default_symbols[i]) < 0)
+        {
+            fprintf(stderr, "Failed to subscribe to %s\n", default_symbols[i]);
+        }
+    }
+    print_status();
+
+    // 设置信号处理
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    // 主循环
+    while (running)
+    {
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        int len = recvfrom(manager.socket, manager.buf, UDP_SIZE, 0,
+                           (struct sockaddr *)&from_addr, &from_len);
+        if (len < 0)
+        {
+            perror("recvfrom failed");
+            continue;
+        }
+
+        Msg *msg = (Msg *)manager.buf;
+        // 查找对应的订阅
+        const char *symbol = NULL;
+        for (int i = 0; i < manager.subscription_count; i++)
+        {
+            if (manager.subscriptions[i].index == msg->index)
+            {
+                symbol = manager.subscriptions[i].symbol;
+                break;
+            }
+        }
+
+        if (symbol != NULL)
+        {
+            long long now = get_current_timestamp_ns();
+            long long latency = now - msg->local_ns;
+
+            if (msg->msg_type == 2)
+            {
+                // 处理深度数据
+                Msg2 *msg2 = (Msg2 *)manager.buf;
+                Msg2Level *levels = (Msg2Level *)(manager.buf + sizeof(Msg2));
+                printf("%s: depth, %zu, %zu, %lld\n",
+                       symbol, msg2->asks_len, msg2->bids_len, latency);
+
+                printf("asks: ");
+                for (size_t i = 0; i < msg2->asks_len; i++)
+                {
+                    printf("%.8g:%.8g, ", levels[i].price, levels[i].size);
+                }
+                printf("\nbids: ");
+                for (size_t i = 0; i < msg2->bids_len; i++)
+                {
+                    printf("%.8g:%.8g, ", levels[msg2->asks_len + i].price,
+                           levels[msg2->asks_len + i].size);
+                }
+                printf("\n");
+            }
+            else if (abs(msg->msg_type) == 1)
+            {
+                // 处理 ticker 数据
+                printf("%s: ticker, %s, %.8g, %.8g, %lld\n",
+                       symbol,
+                       msg->msg_type > 0 ? "bid" : "ask",
+                       msg->price,
+                       msg->size,
+                       latency);
+            }
+            else if (abs(msg->msg_type) == 3)
+            {
+                // 处理交易数据
+                printf("%s: trade, %s, %.8g, %.8g, %lld\n",
+                       symbol,
+                       msg->msg_type > 0 ? "buy" : "sell",
+                       msg->price,
+                       msg->size,
+                       latency);
+            }
+        }
+    }
+
+    // 清理资源前先取消订阅所有符号
+    printf("Unsubscribing all symbols...\n");
+    unsubscribe_all();
+
+    // 清理资源
+    close(manager.socket);
+    printf("Gracefully shut down\n");
+    return 0;
+}
+
+-----------
+
+#include "sdk.c"
+
+#define SHM_NAME "/stream_lite"
+#define L2_SHM_NAME "/stream_lite_l2"
+#define MAX_QUEUE_SIZE 100000
+#define MSG_SIZE sizeof(Msg)
+#define SHM_SIZE sizeof(Queue)
+#define LEVEL_SIZE sizeof(Level)
+#define L2_SHM_SIZE sizeof(LevelQueue)
+
+typedef struct Msg
+{
+    // 1: L1 Bid, -1: L1 Ask, 2: L2 Bid, -2: L2 Ask, 3: Buy Trade, -3: Sell Trade
+    int msg_type;
+    // Index of symbol
+    int index;
+    // Transaction Time MS
+    long tx_ms;
+    // Event Time MS
+    long event_ms;
+    // Local Time NS
+    long local_ns;
+    // Sequence Number / Trade ID
+    long sn_id;
+    // Price
+    double price;
+    // Size
+    double size;
+} Msg;
+
+typedef struct Msg2
+{
+    // 1: L1 Bid, -1: L1 Ask, 2: L2 Bid, -2: L2 Ask, 3: Buy Trade, -3: Sell Trade
+    int msg_type;
+    // Index of symbol
+    int index;
+    // Transaction Time MS
+    long tx_ms;
+    // Event Time MS
+    long event_ms;
+    // Local Time NS
+    long local_ns;
+    // Sequence Number / Trade ID
+    long sn_id;
+    // Index of asks
+    int asks_idx;
+    // Number of asks
+    int asks_len;
+    // Index of bids
+    int bids_idx;
+    // Number of bids
+    int bids_len;
+} Msg2;
+
+typedef struct
+{
+    long from;
+    long to;
+    Msg msgs[MAX_QUEUE_SIZE];
+} Queue;
+
+typedef struct
+{
+    double price;
+    double size;
+} Level;
+
+typedef struct
+{
+    long from;
+    long to;
+    Level levels[MAX_QUEUE_SIZE];
+} LevelQueue;
+
+int fd = 0;
+void *ptr;
+Queue *buf;
+int fd2 = 0;
+void *ptr2;
+LevelQueue *buf2;
+
+long long get_current_timestamp_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+int main()
+{
+    if (init_subscription_manager() < 0)
+    {
+        return 1;
+    }
+
+    // 订阅默认的 symbols
+    const char *default_symbols[] = {
+        "binance-futures:btcusdt",
+        "binance:btcusdt"};
+    for (int i = 0; i < sizeof(default_symbols) / sizeof(default_symbols[0]); i++)
+    {
+        if (subscribe(default_symbols[i]) < 0)
+        {
+            fprintf(stderr, "Failed to subscribe to %s\n", default_symbols[i]);
+        }
+    }
+    print_status();
+
+    fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    if (fd == -1)
+    {
+        perror("shm_open");
+        exit(1);
+    }
+    ptr = mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED)
+    {
+        perror("mmap");
+        close(fd);
+        exit(1);
+    }
+    buf = (Queue *)ptr;
+
+    fd2 = shm_open(L2_SHM_NAME, O_RDWR, 0666);
+    if (fd2 == -1)
+    {
+        perror("shm_open");
+        exit(1);
+    }
+    ptr2 = mmap(0, L2_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd2, 0);
+    if (ptr2 == MAP_FAILED)
+    {
+        perror("mmap");
+        close(fd2);
+        exit(1);
+    }
+    buf2 = (LevelQueue *)ptr2;
+
+    long cur = buf->to;
+
+    // 设置信号处理
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    // 主循环
+    while (running)
+    {
+        while (cur != buf->to)
+        {
+            Msg *msg = (Msg *)&buf->msgs[cur];
+            long now = get_current_timestamp_ns();
+            if (msg->msg_type == 2)
+            {
+                Msg2 *msg = (Msg2 *)&buf->msgs[cur];
+                printf("%lli: %i, %i, %lli, %lli, %lli, %lli, %i, %i, %i, %i\n", cur, msg->index, msg->msg_type, msg->sn_id, msg->tx_ms, msg->event_ms, msg->local_ns, msg->asks_idx, msg->asks_len, msg->bids_idx, msg->bids_len);
+                printf("asks:");
+                for (int i = 0; i < msg->asks_len; i++)
+                {
+                    Level *level = (Level *)&buf2->levels[msg->asks_idx + i];
+                    printf(" %.8g:%.8g,", level->price, level->size);
+                }
+                printf("\nbids:");
+                for (int i = 0; i < msg->bids_len; i++)
+                {
+                    Level *level = (Level *)&buf2->levels[msg->bids_idx + i];
+                    printf(" %.8g:%.8g,", level->price, level->size);
+                }
+                printf("\n");
+            }
+            else
+            {
+                printf("%lli: %i, %i, %lli, %lli, %lli, %lli, %.8g, %.8g\n", cur, msg->index, msg->msg_type, msg->sn_id, msg->tx_ms, msg->event_ms, msg->local_ns, msg->price, msg->size);
+            }
+            printf("latency: %lli ns\n", now - msg->local_ns);
+            cur = (cur + 1) % MAX_QUEUE_SIZE;
+        }
+    }
+
+    munmap(ptr, SHM_SIZE);
+    close(fd);
+
+    return 0;
+}
