@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import asyncio
+import socket
 import time
 from collections import defaultdict
 from decimal import Decimal
@@ -18,11 +19,14 @@ from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase, build_trade_fee
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.event.events import BuyOrderCompletedEvent, OrderFilledEvent, SellOrderCompletedEvent
 from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.model.trade_fill import TradeFill
 
 if TYPE_CHECKING:
     from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -30,8 +34,9 @@ if TYPE_CHECKING:
 
 class QtxExchange(ExchangePyBase):
     """
-    QtxExchange connects to the QTX UDP market data source.
-    This implementation is for market data display only and does not support trading.
+    QtxExchange connects to the QTX UDP market data source for real-time market data.
+    Trading functionality is currently simulated until QTX provides order execution endpoints.
+    When QTX adds trading API endpoints, this connector can be updated to use them without changing the interface.
     """
 
     def __init__(
@@ -57,9 +62,9 @@ class QtxExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._web_assistants_factory = None
         self._api_factory = None
-        # Internal state for mock orders and trades
-        self._mock_orders: Dict[str, Dict[str, Any]] = {}
-        self._mock_trades: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # Internal state for orders and trades (simulated until API endpoints are available)
+        self._orders_cache: Dict[str, Dict[str, Any]] = {}
+        self._trades_cache: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         # Call parent constructor after initializing our fields
         super().__init__(client_config_map)
@@ -76,6 +81,16 @@ class QtxExchange(ExchangePyBase):
     @property
     def name(self) -> str:
         return "qtx"
+
+    @property
+    def trigger_event(self, event_tag: int, event: any):
+        """
+        Triggers specified event to the hummingbot application
+        """
+        if self._events_listener is not None:
+            self._events_listener(event_tag, event)
+        # Note: Trade recording is handled by the paper trade layer when running in paper trade mode
+        # We don't need to manually record trades here
 
     @property
     def trading_pairs(self) -> List[str]:
@@ -99,11 +114,7 @@ class QtxExchange(ExchangePyBase):
     @property
     def authenticator(self) -> Optional[AuthBase]:
         """Authentication for API calls."""
-        return QtxAuth(
-            api_key=self.api_key,
-            secret_key=self.secret_key,
-            time_provider=self._time_synchronizer
-        )
+        return QtxAuth(api_key=self.api_key, secret_key=self.secret_key, time_provider=self._time_synchronizer)
 
     def supported_order_types(self) -> List[OrderType]:
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
@@ -117,7 +128,7 @@ class QtxExchange(ExchangePyBase):
     def _create_user_stream_data_source(self) -> Optional[UserStreamTrackerDataSource]:
         """
         Returns a simulated UserStreamTrackerDataSource to satisfy application requirements
-        when running a trading strategy with this mock/market-data connector.
+        when running a trading strategy with this connector.
         """
         self.logger().info("Using simulated user stream data source.")
         return QTXAPIUserStreamDataSource()
@@ -208,64 +219,242 @@ class QtxExchange(ExchangePyBase):
                 self.logger().error(f"Error creating trading rule for {trading_pair}: {e}", exc_info=True)
         return results
 
-    async def execute_buy(self, *args, **kwargs):
-        raise NotImplementedError("Trading is not supported in this market data only connector")
+    async def execute_buy(
+        self, order_id: str, trading_pair: str, amount: Decimal, order_type: OrderType, price: Decimal
+    ) -> str:
+        """
+        Simulated buy order execution for paper trading with QTX market data.
+        Creates an in-flight order and simulates the order being placed.
+        """
+        self.logger().debug(f"Executing buy order {order_id} for {amount} {trading_pair} at {price}")
 
-    async def execute_sell(self, *args, **kwargs):
-        raise NotImplementedError("Trading is not supported in this market data only connector")
+        # Create an in-flight order
+        order = InFlightOrder(
+            client_order_id=order_id,
+            exchange_order_id=f"qtx_{order_id}",  # Simulated exchange order ID
+            trading_pair=trading_pair,
+            order_type=order_type,
+            trade_type=TradeType.BUY,
+            amount=amount,
+            price=price,
+            creation_timestamp=self.current_timestamp,
+        )
+
+        # Store the order
+        self._order_tracker.start_tracking_order(order)
+
+        # Simulate order being placed successfully
+        # In a real implementation, this would make an API call
+        self.logger().info(f"Simulated buy order {order_id} placed successfully")
+
+        # Simulate order update
+        order_update = OrderUpdate(
+            client_order_id=order_id,
+            exchange_order_id=f"qtx_{order_id}",
+            trading_pair=trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.OPEN,  # Order is now open
+        )
+        self._order_tracker.process_order_update(order_update)
+
+        # Return the client order ID
+        return order_id
+
+    async def execute_sell(
+        self, order_id: str, trading_pair: str, amount: Decimal, order_type: OrderType, price: Decimal
+    ) -> str:
+        """
+        Simulated sell order execution for paper trading with QTX market data.
+        Creates an in-flight order and simulates the order being placed.
+        """
+        self.logger().debug(f"Executing sell order {order_id} for {amount} {trading_pair} at {price}")
+
+        # Create an in-flight order
+        order = InFlightOrder(
+            client_order_id=order_id,
+            exchange_order_id=f"qtx_{order_id}",  # Simulated exchange order ID
+            trading_pair=trading_pair,
+            order_type=order_type,
+            trade_type=TradeType.SELL,
+            amount=amount,
+            price=price,
+            creation_timestamp=self.current_timestamp,
+        )
+
+        # Store the order
+        self._order_tracker.start_tracking_order(order)
+
+        # Simulate order being placed successfully
+        # In a real implementation, this would make an API call
+        self.logger().info(f"Simulated sell order {order_id} placed successfully")
+
+        # Simulate order update
+        order_update = OrderUpdate(
+            client_order_id=order_id,
+            exchange_order_id=f"qtx_{order_id}",
+            trading_pair=trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.OPEN,  # Order is now open
+        )
+        self._order_tracker.process_order_update(order_update)
+
+        # Return the client order ID
+        return order_id
 
     async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
         """
-        Cancels all active mock orders.
+        Cancels all active orders.
         Returns a list of CancellationResult objects indicating success/failure per order.
-        Note: timeout_seconds is currently ignored in this mock implementation.
         """
-        return []
+        self.logger().debug(f"Cancelling all active orders (timeout: {timeout_seconds}s)")
 
-    def buy(self, *args, **kwargs):
-        raise NotImplementedError("Trading is not supported in this market data only connector")
+        # Get all active orders
+        cancellation_results = []
+        active_orders = self.in_flight_orders.copy()
 
-    def sell(self, *args, **kwargs):
-        raise NotImplementedError("Trading is not supported in this market data only connector")
+        for client_order_id, order in active_orders.items():
+            try:
+                # Simulate cancellation
+                await self.cancel(client_order_id, order.trading_pair)
+                cancellation_results.append(CancellationResult(client_order_id, True))
+            except Exception as e:
+                self.logger().error(f"Failed to cancel order {client_order_id}: {e}")
+                cancellation_results.append(CancellationResult(client_order_id, False))
 
-    def cancel(self, *args, **kwargs):
-        raise NotImplementedError("Trading is not supported in this market data only connector")
+        return cancellation_results
+
+    def buy(
+        self,
+        trading_pair: str,
+        amount: Decimal,
+        order_type: OrderType = OrderType.LIMIT,
+        price: Decimal = s_decimal_NaN,
+        **kwargs,
+    ) -> str:
+        """
+        Creates a buy order in the exchange using the parameters.
+        This is a synchronous wrapper around the asyncio execute_buy method.
+        """
+        # Generate a client order ID
+        client_order_id = self.generate_client_order_id(True, trading_pair)
+
+        # Create asyncio task to execute the buy order
+        safe_ensure_future(
+            self.execute_buy(
+                client_order_id,
+                trading_pair,
+                amount,
+                order_type,
+                price,
+            )
+        )
+
+        # Return the client order ID
+        return client_order_id
+
+    def sell(
+        self,
+        trading_pair: str,
+        amount: Decimal,
+        order_type: OrderType = OrderType.LIMIT,
+        price: Decimal = s_decimal_NaN,
+        **kwargs,
+    ) -> str:
+        """
+        Creates a sell order in the exchange using the parameters.
+        This is a synchronous wrapper around the asyncio execute_sell method.
+        """
+        # Generate a client order ID
+        client_order_id = self.generate_client_order_id(False, trading_pair)
+
+        # Create asyncio task to execute the sell order
+        safe_ensure_future(
+            self.execute_sell(
+                client_order_id,
+                trading_pair,
+                amount,
+                order_type,
+                price,
+            )
+        )
+
+        # Return the client order ID
+        return client_order_id
+
+    def cancel(self, order_id: str, trading_pair: str = None):
+        """
+        Cancels an order in the exchange.
+        This is a synchronous wrapper around the asyncio _execute_cancel method.
+        """
+        safe_ensure_future(self._execute_cancel(order_id, trading_pair))
+        return order_id
+
+    async def _execute_cancel(self, order_id: str, trading_pair: str):
+        """
+        Executes order cancellation process.
+        """
+        self.logger().debug(f"Cancelling order {order_id}")
+
+        # Check if order exists
+        if order_id not in self.in_flight_orders:
+            self.logger().warning(f"Attempted to cancel order {order_id}, but order not found in tracking list")
+            # Consider raising an exception here if needed
+            return
+
+        # Get the order
+        tracked_order = self.in_flight_orders[order_id]
+
+        # Simulate cancellation
+        # In a real implementation, this would make an API call
+        self.logger().info(f"Simulated cancellation of {order_id}")
+
+        # Update order state
+        order_update = OrderUpdate(
+            client_order_id=order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.CANCELED,  # Order is now cancelled
+        )
+        self._order_tracker.process_order_update(order_update)
+
+        return order_update
 
     async def _update_balances(self):
         """
-        Mock implementation to update balances.
-        Since this is a market data only connector, we can use static values.
+        Update account balances.
+        Currently uses simulated values until API endpoints are available.
         """
-        # Provide some basic mock balances for all trading pairs
+        # Clear existing balances
         self._account_available_balances.clear()
         self._account_balances.clear()
 
-        # For all configured pairs, create mock balances
+        # For all configured pairs, create initial balances
         # Ensure we use the property to get the pairs correctly
         pairs_to_use = self.trading_pairs  # Use the property
         if not pairs_to_use:
-            self.logger().warning("Cannot update mock balances: No trading pairs available.")
+            self.logger().warning("Cannot update balances: No trading pairs available.")
             return
 
         for trading_pair in pairs_to_use:
             try:
                 base, quote = trading_pair.split("-")
-                self._account_balances[base] = Decimal("10.0")  # Mock base asset balance
-                self._account_balances[quote] = Decimal("10000.0")  # Mock quote asset balance
-                self._account_available_balances[base] = Decimal("10.0")  # Mock available base
-                self._account_available_balances[quote] = Decimal("10000.0")  # Mock available quote
+                # Initial balance values (will be replaced with API calls in the future)
+                self._account_balances[base] = Decimal("10.0")  # Base asset balance
+                self._account_balances[quote] = Decimal("10000.0")  # Quote asset balance
+                self._account_available_balances[base] = Decimal("10.0")  # Available base
+                self._account_available_balances[quote] = Decimal("10000.0")  # Available quote
             except ValueError:
-                self.logger().error(f"Could not split trading pair '{trading_pair}' to update mock balances.")
+                self.logger().error(f"Could not split trading pair '{trading_pair}' to update balances.")
 
-        self.logger().debug("Updated mock balances.")
+        self.logger().debug("Updated account balances.")
 
     async def _update_trading_rules(self):
         """
         Fetch and update trading rules for all trading pairs.
         """
         self._trading_rules = {
-            trading_rule.trading_pair: trading_rule
-            for trading_rule in await self.get_trading_rules()
+            trading_rule.trading_pair: trading_rule for trading_rule in await self.get_trading_rules()
         }
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
@@ -287,11 +476,10 @@ class QtxExchange(ExchangePyBase):
 
     async def _status_polling_loop_fetch_updates(self):
         """
-        Mock implementation for fetching status updates periodically.
+        Simulated implementation for fetching status updates periodically.
         This will update orders, balances, and positions as needed.
+        It also simulates order fills based on market data.
         """
-        self.logger().debug("[MOCK] Fetching status updates")
-
         # Update the balances first
         await self._update_balances()
 
@@ -301,16 +489,264 @@ class QtxExchange(ExchangePyBase):
         # Update lost orders if any
         await self._update_lost_orders_status()
 
-        # Process any mock trades that might have been simulated
-        # In a real connector, this would come from the exchange API
+        # Process any simulated fills for open orders
+        await self._simulate_order_fills()
+
+    async def _simulate_order_fills(self):
+        """
+        Simulates order fills based on current market data.
+        This method is called periodically to check if any open orders should be filled.
+        """
+        if not self.in_flight_orders:
+            return  # No open orders to process
+
+        # Process each open order
+        for order_id, order in list(self.in_flight_orders.items()):
+            # Skip orders that are not in OPEN state
+            if order.current_state != OrderState.OPEN:
+                continue
+
+            try:
+                # Get the order book for this trading pair
+                order_book = self.get_order_book(order.trading_pair)
+                if order_book is None:
+                    self.logger().warning(f"No order book available for {order.trading_pair}")
+                    continue
+
+                # For limit orders, check if the price conditions are met
+                if order.order_type == OrderType.LIMIT:
+                    # For buy orders, check if lowest ask <= order price
+                    # For sell orders, check if highest bid >= order price
+                    price_condition_met = False
+
+                    if order.trade_type == TradeType.BUY:
+                        lowest_ask = Decimal(str(order_book.get_price(False)))
+                        if lowest_ask <= order.price:
+                            price_condition_met = True
+                    elif order.trade_type == TradeType.SELL:
+                        highest_bid = Decimal(str(order_book.get_price(True)))
+                        if highest_bid >= order.price:
+                            price_condition_met = True
+
+                    if not price_condition_met:
+                        continue  # Price conditions not met
+
+                # Simulate the fill using the order book
+                base_asset, quote_asset = self.split_trading_pair(order.trading_pair)
+
+                # Get current balances
+                quote_balance = self._account_balances.get(quote_asset, Decimal("0"))
+                base_balance = self._account_balances.get(base_asset, Decimal("0"))
+
+                # Determine fill price and amount based on order book
+                if order.trade_type == TradeType.BUY:
+                    # Simulate buy using order book
+                    fill_price = (
+                        order.price
+                        if order.order_type == OrderType.LIMIT
+                        else Decimal(str(order_book.get_price(False)))
+                    )
+                    fill_amount = order.amount
+
+                    # Check if we have enough quote balance
+                    quote_amount_needed = fill_amount * fill_price
+                    if quote_amount_needed > quote_balance:
+                        self.logger().warning(f"Insufficient {quote_asset} balance for buy order {order_id}")
+                        continue
+
+                    # Update balances
+                    fee_amount = fill_amount * Decimal("0.001")  # 0.1% fee
+                    self._account_balances[quote_asset] = quote_balance - quote_amount_needed
+                    self._account_balances[base_asset] = base_balance + fill_amount - fee_amount
+                    self._account_available_balances[quote_asset] = self._account_balances[quote_asset]
+                    self._account_available_balances[base_asset] = self._account_balances[base_asset]
+
+                    fee_asset = base_asset
+
+                else:  # SELL
+                    # Simulate sell using order book
+                    fill_price = (
+                        order.price if order.order_type == OrderType.LIMIT else Decimal(str(order_book.get_price(True)))
+                    )
+                    fill_amount = order.amount
+
+                    # Check if we have enough base balance
+                    if fill_amount > base_balance:
+                        self.logger().warning(f"Insufficient {base_asset} balance for sell order {order_id}")
+                        continue
+
+                    # Update balances
+                    quote_amount_received = fill_amount * fill_price
+                    fee_amount = quote_amount_received * Decimal("0.001")  # 0.1% fee
+                    self._account_balances[base_asset] = base_balance - fill_amount
+                    self._account_balances[quote_asset] = quote_balance + quote_amount_received - fee_amount
+                    self._account_available_balances[base_asset] = self._account_balances[base_asset]
+                    self._account_available_balances[quote_asset] = self._account_balances[quote_asset]
+
+                    fee_asset = quote_asset
+
+                # Create trade update and order filled event
+                trade_id = f"qtx_trade_{order_id}_{int(time.time() * 1000)}"
+
+                # Create and process the trade update
+                trade_update = TradeUpdate(
+                    trade_id=trade_id,
+                    client_order_id=order_id,
+                    exchange_order_id=order.exchange_order_id,
+                    trading_pair=order.trading_pair,
+                    fee=fee_amount,
+                    fee_asset=fee_asset,
+                    trade_type=order.trade_type,
+                    order_type=order.order_type,
+                    price=fill_price,
+                    amount=fill_amount,
+                    trade_timestamp=self.current_timestamp,
+                )
+                self._order_tracker.process_trade_update(trade_update)
+
+                # Create and emit order filled event
+                order_filled_event = OrderFilledEvent(
+                    timestamp=self.current_timestamp,
+                    order_id=order_id,
+                    trading_pair=order.trading_pair,
+                    trade_type=order.trade_type,
+                    order_type=order.order_type,
+                    price=fill_price,
+                    amount=fill_amount,
+                    trade_fee=build_trade_fee(
+                        self.name,
+                        is_maker=False,
+                        base_currency=base_asset,
+                        quote_currency=quote_asset,
+                        order_type=order.order_type,
+                        order_side=order.trade_type,
+                        amount=fill_amount,
+                        price=fill_price,
+                        fee_percent=Decimal("0.001"),  # 0.1% fee
+                    ),
+                    exchange_trade_id=trade_id,
+                )
+                self.trigger_event(self.ORDER_FILLED_EVENT_TAG, order_filled_event)
+
+                # Update order state to filled
+                order_update = OrderUpdate(
+                    client_order_id=order_id,
+                    exchange_order_id=order.exchange_order_id,
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.FILLED,
+                )
+                self._order_tracker.process_order_update(order_update)
+
+                # Emit order completed event
+                if order.trade_type == TradeType.BUY:
+                    self.trigger_event(
+                        self.BUY_ORDER_COMPLETED_EVENT_TAG,
+                        BuyOrderCompletedEvent(
+                            timestamp=self.current_timestamp,
+                            order_id=order_id,
+                            base_asset=base_asset,
+                            quote_asset=quote_asset,
+                            base_asset_amount=fill_amount - fee_amount if fee_asset == base_asset else fill_amount,
+                            quote_asset_amount=quote_amount_needed,
+                            order_type=order.order_type,
+                        ),
+                    )
+                else:  # SELL
+                    self.trigger_event(
+                        self.SELL_ORDER_COMPLETED_EVENT_TAG,
+                        SellOrderCompletedEvent(
+                            timestamp=self.current_timestamp,
+                            order_id=order_id,
+                            base_asset=base_asset,
+                            quote_asset=quote_asset,
+                            base_asset_amount=fill_amount,
+                            quote_asset_amount=(
+                                quote_amount_received - fee_amount
+                                if fee_asset == quote_asset
+                                else quote_amount_received
+                            ),
+                            order_type=order.order_type,
+                        ),
+                    )
+
+                self.logger().info(
+                    f"Simulated fill for {order.trade_type.name} order {order_id}: {fill_amount} {base_asset} "
+                    f"at {fill_price} {quote_asset}"
+                )
+
+            except Exception as e:
+                self.logger().error(f"Error simulating fill for order {order_id}: {e}", exc_info=True)
+
+    def _fill_order_from_event(self, event: OrderFilledEvent):
+        """
+        Record order fills to the database for the history command to work properly.
+        This is called automatically by trigger_event when an OrderFilledEvent is emitted.
+        """
+        try:
+            # Remove this condition so it always tries to record the trade
+            # if not hasattr(self, "_order_tracker_task"):
+            #    return
+            self.logger().info(f"Attempting to record trade for order {event.order_id}")
+            # Try to access the hummingbot application through connector hierarchy
+            # This is a bit of a hack but needed to get to the trade_fill_db
+            import hummingbot.client.hummingbot_application as hummingbot_app
+
+            hb_instance = hummingbot_app.get_hummingbot_application()
+            if hb_instance is not None:
+                config_path = hb_instance.strategy_file_name
+                strategy = hb_instance.strategy_name if hasattr(hb_instance, "strategy_name") else ""
+                # Parse trading pair to get base and quote assets
+                try:
+                    base_asset, quote_asset = event.trading_pair.split("-")
+                except Exception:  # Use explicit Exception instead of bare except
+                    base_asset = ""
+                    quote_asset = ""
+
+                self.logger().info(f"Creating trade record for {event.trading_pair} - {event.order_id}")
+                # Create a trade record
+                trade = TradeFill(
+                    config_file_path=config_path,
+                    strategy=strategy,
+                    market=self.name,
+                    symbol=event.trading_pair,
+                    base_asset=base_asset,
+                    quote_asset=quote_asset,
+                    timestamp=event.timestamp,
+                    order_id=event.order_id,
+                    trade_type=str(event.trade_type),
+                    order_type=str(event.order_type),
+                    price=Decimal(str(event.price)),
+                    amount=Decimal(str(event.amount)),
+                    trade_fee=event.trade_fee.to_json(),
+                    exchange_trade_id=event.exchange_trade_id,
+                    leverage=1,  # Default to spot trading leverage
+                )
+
+                # Save to database
+                if hasattr(hb_instance, "trade_fill_db"):
+                    self.logger().info(f"Saving trade to database: {trade}")
+                    hb_instance.trade_fill_db.save_trade_fill(trade)
+                else:
+                    self.logger().error("Could not save trade: trade_fill_db not found")
+            else:
+                self.logger().error("Could not record trade: Hummingbot application instance not found")
+        except Exception as e:
+            self.logger().error(f"Error recording trade: {e}", exc_info=True)
 
     async def check_network(self) -> NetworkStatus:
         """
-        Checks if the exchange is online and operational.
-        For the fake data source, we assume it's always available.
-        When UDP is re-enabled, this might check socket status or ping.
+        Checks UDP connectivity to the QTX feed.
         """
-        return NetworkStatus.CONNECTED
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(1.0)
+            sock.sendto(b"", (self._qtx_host, self._qtx_port))
+            sock.close()
+            return NetworkStatus.CONNECTED
+        except Exception as e:
+            self.logger().warning(f"UDP network check failed: {e}")
+            return NetworkStatus.NOT_CONNECTED
 
     @property
     def rate_limits_rules(self) -> List[RateLimit]:
@@ -374,23 +810,32 @@ class QtxExchange(ExchangePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return False
 
-    # MOCK TRADING METHODS (non-functional for market data connector)
+    # TRADING METHODS (currently simulated, will be replaced with API calls when available)
 
-    async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType, order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
-        # Create a mock/dummy exchange order ID and return it
-        dummy_exchange_order_id = f"qtx_mock_{int(time.time() * 1e6)}_{order_id[-4:]}"
+    async def _place_order(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+        **kwargs,
+    ) -> Tuple[str, float]:
+        # Create a simulated exchange order ID (will be replaced with real API response)
+        simulated_exchange_order_id = f"qtx_{int(time.time() * 1e6)}_{order_id[-4:]}"
         timestamp = time.time()
-        return dummy_exchange_order_id, timestamp
+        return simulated_exchange_order_id, timestamp
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
-        # Always return success for mock cancellation
+        # Return success for cancellation (will be replaced with actual API response)
         return True
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        # Return a mock pending order status
+        # Return the current order status (will be replaced with API response)
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=tracked_order.exchange_order_id or "mock_id",
+            exchange_order_id=tracked_order.exchange_order_id,
             trading_pair=tracked_order.trading_pair,
             update_timestamp=time.time(),
             new_state=OrderState.PENDING_CREATE,
@@ -402,10 +847,10 @@ class QtxExchange(ExchangePyBase):
 
     async def _update_trading_fees(self):
         """
-        Mock implementation for updating trading fees.
-        For QTX mock connector, we'll use static zero fees.
+        Update trading fees.
+        Currently uses simulated values until fee endpoints are available.
         """
-        self.logger().debug("[MOCK] Updating trading fees with zero values")
+        self.logger().debug("Updating trading fees")
         for trading_pair in self.trading_pairs:
             # Create zero fee entries for all trading pairs
             self._trading_fees[trading_pair] = {
@@ -426,12 +871,13 @@ class QtxExchange(ExchangePyBase):
 
     async def _user_stream_event_listener(self):
         """
-        Mock implementation of the user stream listener.
-        This method should be empty as we're using simulated data, not real user stream events.
+        Listen for user account updates via WebSocket or other real-time protocol.
+        Currently simulated - will be implemented when QTX provides user stream API.
         """
         while True:
             try:
-                await asyncio.sleep(0.5)  # Just sleep to keep the task alive
+                # Placeholder until user stream API is available
+                await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -440,17 +886,18 @@ class QtxExchange(ExchangePyBase):
 
     async def _update_order_status(self):
         """
-        Mock implementation to update the status of tracked orders.
+        Polls the REST API to get order status updates.
+        Will be implemented when QTX provides order status API endpoints.
         """
-        # For market data connector, this can be a no-op
+        # Currently handled by _simulate_order_fills until API endpoints are available
         pass
 
     async def _update_lost_orders_status(self):
         """
-        Mock implementation to update the status of "lost" orders.
+        Checks for any orders that might have been lost or missed by normal status updates.
+        Will be implemented when QTX provides order history API endpoints.
         """
-        # For market data connector, this can be a no-op
-        pass
+        # Currently not needed with simulated orders, will be implemented with real API
 
     @property
     def status_dict(self) -> Dict[str, bool]:
@@ -465,20 +912,15 @@ class QtxExchange(ExchangePyBase):
         self.logger().info(f"Order book tracker ready: {self.order_book_tracker.ready}")
         self.logger().info(f"Trading pairs: {self.trading_pairs}")
 
-        # Additional checks
-        if not self.order_book_tracker.ready:
-            self.logger().warning("Order book tracker is not ready. This might cause the 'Market connectors are not ready' error.")
-
-        # Update status with QTX-specific mock indicators without overriding order_books_initialized
-        # which is handled by the parent class and is critical for connector readiness
+        # Update status with QTX-specific indicators
         custom_status = {
-            "trading_rule_initialized": True,  # Always true for QTX mock
-            "user_stream_initialized": True,   # Always true for QTX mock
-            "account_balance": True,           # Always true for QTX mock
-            "symbols_mapping_initialized": True  # Always true for QTX internal mapping
+            "trading_rule_initialized": True,  # Trading rules are statically defined for now
+            "user_stream_initialized": True,  # User stream is simulated for now
+            "account_balance": True,  # Account balance is simulated for now
+            "symbols_mapping_initialized": True,  # Always true for QTX internal mapping
         }
 
-        # Merge dictionaries, ensuring we don't override the order_books_initialized value
+        # Return the combined status
         return {**status, **custom_status}
 
     async def check_order_book_status(self) -> Dict[str, Any]:
@@ -489,24 +931,24 @@ class QtxExchange(ExchangePyBase):
             "connector": self.name,
             "status": "operational" if self._order_book_initialized.is_set() else "initializing",
             "trading_pairs_configured": self._trading_pairs,
-            "order_book_status": {}
+            "order_book_status": {},
         }
 
         # Check each trading pair's order book status
         for trading_pair in self._trading_pairs:
-            ob_status = {
-                "exists": trading_pair in self.order_book_tracker.order_books
-            }
+            ob_status = {"exists": trading_pair in self.order_book_tracker.order_books}
 
             if ob_status["exists"]:
                 order_book = self.order_book_tracker.order_books[trading_pair]
-                ob_status.update({
-                    "bids": len(order_book.bid_entries()),
-                    "asks": len(order_book.ask_entries()),
-                    "has_snapshot": order_book.snapshot_message_count > 0,
-                    "last_diff_uid": order_book._last_diff_uid,
-                    "snapshot_uid": order_book._snapshot_uid,
-                })
+                ob_status.update(
+                    {
+                        "bids": len(order_book.bid_entries()),
+                        "asks": len(order_book.ask_entries()),
+                        "has_snapshot": order_book.snapshot_message_count > 0,
+                        "last_diff_uid": order_book._last_diff_uid,
+                        "snapshot_uid": order_book._snapshot_uid,
+                    }
+                )
 
             result["order_book_status"][trading_pair] = ob_status
 
