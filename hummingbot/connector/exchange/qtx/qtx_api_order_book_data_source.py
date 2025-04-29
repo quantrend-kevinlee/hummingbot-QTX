@@ -138,6 +138,7 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Regular spot pair
             pair = trading_pair.replace("-", "").lower()
         
+        self.logger().info(f"Converting {trading_pair} to exchange format: {exchange}:{pair}")
         return f"{exchange}:{pair}"
     
     def _parse_binary_message(self, data: bytes) -> Optional[Dict[str, Any]]:
@@ -321,45 +322,66 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return None
                 
             exchange, pair = exchange_trading_pair.split(":")
+            result = None
             
             # Special case for futures
             if exchange == "binance-futures":
                 # Add -PERP suffix for perpetual futures
-                if "btc" in pair.lower() and "usdt" in pair.lower():
-                    result = "BTC-USDT-PERP"
-                elif "eth" in pair.lower() and "usdt" in pair.lower():
-                    result = "ETH-USDT-PERP"
-                else:
-                    # For other futures pairs
-                    for base in ["BTC", "ETH", "BNB", "SOL", "XRP"]:
-                        if base.lower() in pair.lower():
-                            quote = pair.lower().replace(base.lower(), "").upper()
-                            if quote:
+                # Try to intelligently parse the trading pair
+                # Look for common base assets
+                common_base_assets = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOT", "ADA"]
+                for base in common_base_assets:
+                    if base.lower() in pair.lower():
+                        quote = pair.lower().replace(base.lower(), "").upper()
+                        if quote:
+                            result = f"{base}-{quote}-PERP"
+                            break
+                
+                if result is None:
+                    self.logger().warning(f"Could not convert futures pair: {exchange_trading_pair}")
+                    # Check if we can find any common quote assets
+                    common_quote_assets = ["USDT", "USD", "BUSD", "USDC"]
+                    for quote in common_quote_assets:
+                        if quote.lower() in pair.lower():
+                            base = pair.lower().replace(quote.lower(), "").upper()
+                            if base:
                                 result = f"{base}-{quote}-PERP"
                                 break
-                    else:
-                        self.logger().warning(f"Could not convert futures pair: {exchange_trading_pair}")
-                        return None
             else:
                 # Regular spot pairs
-                if "btc" in pair.lower() and "usdt" in pair.lower():
-                    result = "BTC-USDT"
-                elif "eth" in pair.lower() and "usdt" in pair.lower():
-                    result = "ETH-USDT"
-                elif "eth" in pair.lower() and "btc" in pair.lower():
-                    result = "ETH-BTC"
-                else:
-                    # For other pairs, try a basic conversion
-                    for base in ["BTC", "ETH", "BNB", "SOL", "XRP"]:
+                # First, check for configured trading pairs from Hummingbot
+                for trading_pair in self._trading_pairs:
+                    formatted_pair = trading_pair.replace("-", "").lower()
+                    if formatted_pair == pair.lower():
+                        result = trading_pair
+                        break
+                
+                # If not found in configured pairs, try intelligent parsing
+                if result is None:
+                    # Try to intelligently parse the trading pair
+                    common_base_assets = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOT", "ADA"]
+                    for base in common_base_assets:
                         if base.lower() in pair.lower():
                             quote = pair.lower().replace(base.lower(), "").upper()
                             if quote:
                                 result = f"{base}-{quote}"
                                 break
-                    else:
-                        self.logger().warning(f"Could not convert exchange pair: {exchange_trading_pair}")
-                        return None
+                
+                # If still not found, try looking for common quote assets
+                if result is None:
+                    common_quote_assets = ["USDT", "USD", "BUSD", "USDC", "BTC", "ETH"]
+                    for quote in common_quote_assets:
+                        if quote.lower() in pair.lower():
+                            base = pair.lower().replace(quote.lower(), "").upper()
+                            if base:
+                                result = f"{base}-{quote}"
+                                break
             
+            # If we still couldn't parse it, log and return None
+            if result is None:
+                self.logger().warning(f"Could not convert exchange pair: {exchange_trading_pair}")
+                return None
+                
             # Cache the conversion
             self._exchange_trading_pairs[exchange_trading_pair] = result
             self.logger().info(f"Mapped {exchange_trading_pair} to {result}")
@@ -415,43 +437,56 @@ class QTXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Subscribe to symbols
             self._subscription_indices = {}
             subscription_success = False
-            
+
             for trading_pair in self._trading_pairs:
-                # Convert from Hummingbot format to QTX format
                 qtx_symbol = self._convert_to_exchange_trading_pair(trading_pair)
                 self.logger().info(f"Subscribing to symbol: {qtx_symbol} for {trading_pair}")
-                
-                # Send subscription request
-                self._socket.sendto(qtx_symbol.encode(), (self._qtx_host, self._qtx_port))
-                
-                # Temporarily set socket to blocking to receive response
-                self._socket.setblocking(True)
-                self._socket.settimeout(5.0)  # 5 second timeout
-                
                 try:
-                    # Receive response (index number)
-                    response, _ = self._socket.recvfrom(CONSTANTS.DEFAULT_UDP_BUFFER_SIZE)
-                    if response:
+                    # Send subscription request
+                    self._socket.sendto(qtx_symbol.encode(), (self._qtx_host, self._qtx_port))
+                    # Temporarily set socket to blocking for ACK
+                    self._socket.setblocking(True)
+                    self._socket.settimeout(5.0)
+                    deadline = time.time() + 5.0
+                    index = None
+                    while time.time() < deadline:
                         try:
-                            # Parse response (expecting an index number)
-                            index = int(response.decode().strip())
-                            self._subscription_indices[index] = trading_pair
-                            self.logger().info(f"Successfully subscribed to {qtx_symbol} with index {index}")
-                            subscription_success = True
-                        except ValueError as ve:
-                            self.logger().error(f"Invalid response for {qtx_symbol}: {response.decode().strip()}")
-                except socket.timeout:
-                    self.logger().error(f"Timeout while waiting for subscription response for {qtx_symbol}")
+                            response, addr = self._socket.recvfrom(CONSTANTS.DEFAULT_UDP_BUFFER_SIZE)
+                        except socket.timeout:
+                            self.logger().error(f"Timeout waiting for ACK for {qtx_symbol}")
+                            break
+                        # ignore any packet not from the server
+                        if addr[0] != self._qtx_host:
+                            continue
+                        try:
+                            idx = int(response.decode().strip())
+                            index = idx
+                            self.logger().info(f"Got ACK {idx} for {qtx_symbol}")
+                            break
+                        except (UnicodeDecodeError, ValueError):
+                            continue
+                    if index is None:
+                        self.logger().error(f"No valid ACK for {qtx_symbol}")
+                        continue
+                    self._subscription_indices[index] = trading_pair
+                    subscription_success = True
+                    self.logger().info(f"Successfully subscribed to {qtx_symbol} with index {index}")
                 except Exception as e:
                     self.logger().error(f"Error subscribing to {qtx_symbol}: {e}")
-            
-            # Set socket back to non-blocking for message handling
-            self._socket.setblocking(False)
-            
+                finally:
+                    # Restore non-blocking mode
+                    self._socket.setblocking(False)
+                # Small delay before next subscription
+                await asyncio.sleep(0.1)
+
+            # Check subscription outcome
             if not subscription_success:
                 self.logger().error("No successful subscriptions, UDP feed may not work properly")
             else:
                 self.logger().info(f"Subscribed to {len(self._subscription_indices)} symbols: {self._subscription_indices}")
+            
+            # Set socket back to non-blocking for message handling
+            self._socket.setblocking(False)
             
             # Start receiving UDP data
             try:

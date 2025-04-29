@@ -1,29 +1,25 @@
 #!/usr/bin/env python
 
 import asyncio
+import time
 from collections import defaultdict
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-import time
-
-from bidict import bidict
-
-from hummingbot.core.data_type.cancellation_result import CancellationResult
-from hummingbot.core.utils.async_utils import safe_gather, safe_ensure_future
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from hummingbot.connector.constants import s_decimal_NaN
-from hummingbot.connector.exchange.qtx import qtx_constants as CONSTANTS, qtx_utils
+from hummingbot.connector.exchange.qtx import qtx_utils
 from hummingbot.connector.exchange.qtx.qtx_api_order_book_data_source import QTXAPIOrderBookDataSource
-from hummingbot.connector.exchange.qtx.qtx_user_stream_data_source import QTXAPIUserStreamDataSource
 from hummingbot.connector.exchange.qtx.qtx_auth import QtxAuth
-from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeUpdate
-from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.connector.exchange.qtx.qtx_user_stream_data_source import QTXAPIUserStreamDataSource
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.api_throttler.data_types import RateLimit
+from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
+from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -41,27 +37,23 @@ class QtxExchange(ExchangePyBase):
     def __init__(
         self,
         client_config_map: "ClientConfigAdapter",
-        qtx_host: str = CONSTANTS.DEFAULT_UDP_HOST,
-        qtx_port: int = CONSTANTS.DEFAULT_UDP_PORT,
-        trading_pairs: Optional[List[str]] = None,
+        qtx_api_key: str,
+        qtx_secret_key: str,
+        qtx_host: str,
+        qtx_port: int,
+        trading_pairs: List[str],
         trading_required: bool = True,
-        qtx_api_key: str = "",
-        qtx_secret_key: str = "",
         **kwargs,  # Accept arbitrary keyword args to prevent TypeError
     ):
         self._qtx_host = qtx_host
         self._qtx_port = qtx_port
         self.api_key = qtx_api_key
         self.secret_key = qtx_secret_key
-        
-        # Initialize trading pairs from configuration
-        self._trading_pairs = trading_pairs if trading_pairs else []
-        
-        # For mock data, always ensure we have at least one trading pair
-        if not self._trading_pairs:
-            self._trading_pairs = ["BTC-USDT"]
-            self.logger().info(f"No trading pairs configured, using default pair: {self._trading_pairs}")
-            
+
+        # Assign the renamed parameter to the internal _trading_pairs attribute
+        self._trading_pairs = trading_pairs
+
+        # Initialize other attributes
         self._trading_required = trading_required
         self._web_assistants_factory = None
         self._api_factory = None
@@ -69,6 +61,7 @@ class QtxExchange(ExchangePyBase):
         self._mock_orders: Dict[str, Dict[str, Any]] = {}
         self._mock_trades: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+        # Call parent constructor after initializing our fields
         super().__init__(client_config_map)
 
     async def _make_trading_pairs_request(self) -> Optional[Dict[str, Any]]:
@@ -77,7 +70,7 @@ class QtxExchange(ExchangePyBase):
         Returns None as the actual mapping is handled by
         _initialize_trading_pair_symbols_from_exchange_info based on configured pairs.
         """
-        self.logger().info("Skipping REST call for trading pairs, using configured pairs.")
+
         return None
 
     @property
@@ -85,9 +78,14 @@ class QtxExchange(ExchangePyBase):
         return "qtx"
 
     @property
-    def trading_pairs(self):
-        if not hasattr(self, "_trading_pairs") or self._trading_pairs is None:
-             self._trading_pairs = []
+    def trading_pairs(self) -> List[str]:
+        """
+        Return trading pairs, ensuring we have valid pairs.
+        """
+        if not hasattr(self, "_trading_pairs"):
+            return []
+        if not isinstance(self._trading_pairs, list):
+            return []
         return self._trading_pairs
 
     @property
@@ -193,11 +191,11 @@ class QtxExchange(ExchangePyBase):
                 self.logger().warning(f"Invalid trading_pair type found in list: {trading_pair}. Skipping.")
                 continue
             try:
-                 min_price_increment = Decimal("0.00001")
-                 min_base_increment = Decimal("0.001")
-                 min_notional = Decimal("0.01")
+                min_price_increment = Decimal("0.00001")
+                min_base_increment = Decimal("0.001")
+                min_notional = Decimal("0.01")
 
-                 results.append(
+                results.append(
                     TradingRule(
                         trading_pair=trading_pair,
                         min_order_size=Decimal("0.001"),
@@ -205,9 +203,9 @@ class QtxExchange(ExchangePyBase):
                         min_base_amount_increment=min_base_increment,
                         min_notional_size=min_notional,
                     )
-                 )
+                )
             except Exception as e:
-                 self.logger().error(f"Error creating trading rule for {trading_pair}: {e}", exc_info=True)
+                self.logger().error(f"Error creating trading rule for {trading_pair}: {e}", exc_info=True)
         return results
 
     async def execute_buy(self, *args, **kwargs):
@@ -243,12 +241,21 @@ class QtxExchange(ExchangePyBase):
         self._account_balances.clear()
 
         # For all configured pairs, create mock balances
-        for trading_pair in self.trading_pairs:
-            base, quote = trading_pair.split("-")
-            self._account_balances[base] = Decimal("10.0")  # Mock base asset balance
-            self._account_balances[quote] = Decimal("10000.0")  # Mock quote asset balance
-            self._account_available_balances[base] = Decimal("10.0")  # Mock available base
-            self._account_available_balances[quote] = Decimal("10000.0")  # Mock available quote
+        # Ensure we use the property to get the pairs correctly
+        pairs_to_use = self.trading_pairs  # Use the property
+        if not pairs_to_use:
+            self.logger().warning("Cannot update mock balances: No trading pairs available.")
+            return
+
+        for trading_pair in pairs_to_use:
+            try:
+                base, quote = trading_pair.split("-")
+                self._account_balances[base] = Decimal("10.0")  # Mock base asset balance
+                self._account_balances[quote] = Decimal("10000.0")  # Mock quote asset balance
+                self._account_available_balances[base] = Decimal("10.0")  # Mock available base
+                self._account_available_balances[quote] = Decimal("10000.0")  # Mock available quote
+            except ValueError:
+                self.logger().error(f"Could not split trading pair '{trading_pair}' to update mock balances.")
 
         self.logger().debug("Updated mock balances.")
 
@@ -268,14 +275,15 @@ class QtxExchange(ExchangePyBase):
         """
         self._trading_pair_symbol_map = {}
         self._symbol_trading_pair_map = {}
-        
-        for trading_pair in self._trading_pairs:
+
+        # Use the trading_pairs property to ensure we have valid pairs
+        pairs_to_map = self.trading_pairs
+
+        for trading_pair in pairs_to_map:
             # Convert to exchange symbol format (lowercase, no separator)
             exchange_symbol = qtx_utils.format_trading_pair(trading_pair)
             self._trading_pair_symbol_map[trading_pair] = exchange_symbol
             self._symbol_trading_pair_map[exchange_symbol] = trading_pair
-            
-        self.logger().info(f"Initialized {len(self._trading_pair_symbol_map)} trading pairs for {self.name}.")
 
     async def _status_polling_loop_fetch_updates(self):
         """
@@ -283,16 +291,16 @@ class QtxExchange(ExchangePyBase):
         This will update orders, balances, and positions as needed.
         """
         self.logger().debug("[MOCK] Fetching status updates")
-        
+
         # Update the balances first
         await self._update_balances()
-        
+
         # Update open orders
         await self._update_order_status()
-        
+
         # Update lost orders if any
         await self._update_lost_orders_status()
-        
+
         # Process any mock trades that might have been simulated
         # In a real connector, this would come from the exchange API
 
@@ -320,7 +328,7 @@ class QtxExchange(ExchangePyBase):
 
     @property
     def client_order_id_prefix(self) -> Optional[str]:
-         return None
+        return None
 
     @property
     def trading_pairs_request_path(self) -> str:
@@ -338,18 +346,17 @@ class QtxExchange(ExchangePyBase):
         return "/not_used"
 
     def _create_web_assistants_factory(self) -> Optional[WebAssistantsFactory]:
-         """
-         Create a minimal WebAssistantsFactory instance to satisfy status checks.
-         """
-         from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-         from hummingbot.core.web_assistant.connections.data_types import RESTMethod
-         from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+        """
+        Create a minimal WebAssistantsFactory instance to satisfy status checks.
+        """
+        from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+        from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-         # Create a throttler if it doesn't exist
-         if self._throttler is None:
-             self._throttler = AsyncThrottler(rate_limits=[])
+        # Create a throttler if it doesn't exist
+        if self._throttler is None:
+            self._throttler = AsyncThrottler(rate_limits=[])
 
-         return WebAssistantsFactory(throttler=self._throttler, auth=self._auth)
+        return WebAssistantsFactory(throttler=self._throttler, auth=self._auth)
 
     async def _format_trading_rules(self, exchange_info: Any) -> List[TradingRule]:
         """
@@ -368,18 +375,18 @@ class QtxExchange(ExchangePyBase):
         return False
 
     # MOCK TRADING METHODS (non-functional for market data connector)
-    
+
     async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType, order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
         # Create a mock/dummy exchange order ID and return it
         dummy_exchange_order_id = f"qtx_mock_{int(time.time() * 1e6)}_{order_id[-4:]}"
         timestamp = time.time()
         return dummy_exchange_order_id, timestamp
 
-    async def _place_cancel(self, order_id: str, tracked_order: 'InFlightOrder') -> bool:
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         # Always return success for mock cancellation
         return True
 
-    async def _request_order_status(self, tracked_order: 'InFlightOrder') -> OrderUpdate:
+    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         # Return a mock pending order status
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -389,7 +396,7 @@ class QtxExchange(ExchangePyBase):
             new_state=OrderState.PENDING_CREATE,
         )
 
-    async def _all_trade_updates_for_order(self, order: 'InFlightOrder') -> List[TradeUpdate]:
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         # Return empty list as no actual trades happen
         return []
 
@@ -444,20 +451,20 @@ class QtxExchange(ExchangePyBase):
         """
         # For market data connector, this can be a no-op
         pass
-    
+
     @property
     def status_dict(self) -> Dict[str, bool]:
         """
         Returns a dictionary with status indicators for the connector's readiness.
         """
         # Get base status from parent class
-        status = super().status_dict 
-        
+        status = super().status_dict
+
         # Log the status details for debugging
         self.logger().info(f"QTX connector status: {status}")
         self.logger().info(f"Order book tracker ready: {self.order_book_tracker.ready}")
         self.logger().info(f"Trading pairs: {self.trading_pairs}")
-        
+
         # Additional checks
         if not self.order_book_tracker.ready:
             self.logger().warning("Order book tracker is not ready. This might cause the 'Market connectors are not ready' error.")
@@ -468,12 +475,12 @@ class QtxExchange(ExchangePyBase):
             "trading_rule_initialized": True,  # Always true for QTX mock
             "user_stream_initialized": True,   # Always true for QTX mock
             "account_balance": True,           # Always true for QTX mock
-            "symbols_mapping_initialized": True, # Always true for QTX internal mapping
+            "symbols_mapping_initialized": True  # Always true for QTX internal mapping
         }
 
         # Merge dictionaries, ensuring we don't override the order_books_initialized value
         return {**status, **custom_status}
-        
+
     async def check_order_book_status(self) -> Dict[str, Any]:
         """
         Diagnostic function to check the status of the order books for all trading pairs.
@@ -484,13 +491,13 @@ class QtxExchange(ExchangePyBase):
             "trading_pairs_configured": self._trading_pairs,
             "order_book_status": {}
         }
-        
+
         # Check each trading pair's order book status
         for trading_pair in self._trading_pairs:
             ob_status = {
                 "exists": trading_pair in self.order_book_tracker.order_books
             }
-            
+
             if ob_status["exists"]:
                 order_book = self.order_book_tracker.order_books[trading_pair]
                 ob_status.update({
@@ -500,13 +507,13 @@ class QtxExchange(ExchangePyBase):
                     "last_diff_uid": order_book._last_diff_uid,
                     "snapshot_uid": order_book._snapshot_uid,
                 })
-            
+
             result["order_book_status"][trading_pair] = ob_status
-        
+
         self.logger().info(f"Order book status: {result}")
         return result
 
-    async def _update_time_synchronizer(self, time_provider: Optional[callable] = None):
+    async def _update_time_synchronizer(self, time_provider: Optional[Callable] = None):
         """
         Override base method to prevent time synchronization attempts
         as this connector does not use REST APIs requiring it currently.

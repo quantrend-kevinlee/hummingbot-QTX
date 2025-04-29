@@ -35,8 +35,8 @@ def format_trading_pair(trading_pair: str) -> str:
     :return: the trading pair in QTX format (e.g., "btcusdt")
     """
     # Remove the hyphen and convert to lowercase
-    base, quote = trading_pair.split("-")
-    return f"{base.lower()}{quote.lower()}"
+    trading_pair = trading_pair.replace("-", "").lower()
+    return trading_pair
 
 
 def convert_from_exchange_trading_pair(exchange_symbol: str) -> str:
@@ -70,20 +70,6 @@ def convert_from_exchange_trading_pair(exchange_symbol: str) -> str:
 
 class QTXConfigMap(BaseConnectorConfigMap):
     connector: str = "qtx"
-    trading_pairs: List[str] = Field(
-        default=[EXAMPLE_PAIR],
-        json_schema_extra={
-            "prompt": lambda cm: "Enter the trading pairs (comma-separated, e.g. BTC-USDT, ETH-USDT)",
-            "prompt_on_new": True,
-        },
-    )
-
-    @field_validator("trading_pairs", mode="before")
-    def _parse_trading_pairs(cls, v):
-        # Allow comma-separated string input and convert to list
-        if isinstance(v, str):
-            return [tp.strip() for tp in v.split(",") if tp.strip()]
-        return v
 
     qtx_host: str = Field(
         default=CONSTANTS.DEFAULT_UDP_HOST,
@@ -91,6 +77,7 @@ class QTXConfigMap(BaseConnectorConfigMap):
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX UDP host IP address",
             "prompt_on_new": True,
+            "is_connect_key": True,
         },
     )
     qtx_port: int = Field(
@@ -99,6 +86,7 @@ class QTXConfigMap(BaseConnectorConfigMap):
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX UDP port",
             "prompt_on_new": True,
+            "is_connect_key": True,
         },
     )
 
