@@ -75,7 +75,6 @@ class QTXConfigMap(BaseConnectorConfigMap):
 
     qtx_host: str = Field(
         default=CONSTANTS.DEFAULT_UDP_HOST,
-        client_data=None,
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX UDP host IP address",
             "prompt_on_new": True,
@@ -84,7 +83,6 @@ class QTXConfigMap(BaseConnectorConfigMap):
     )
     qtx_port: int = Field(
         default=CONSTANTS.DEFAULT_UDP_PORT,
-        client_data=None,
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX UDP port",
             "prompt_on_new": True,
@@ -94,21 +92,21 @@ class QTXConfigMap(BaseConnectorConfigMap):
 
     qtx_api_key: str = Field(
         default="fake_api_key",
-        client_data=None,
         secret=True,
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX API key",
             "prompt_on_new": True,
+            "is_secure": True,
             "is_connect_key": True,
         },
     )
     qtx_secret_key: str = Field(
         default="fake_secret_key",
-        client_data=None,
         secret=True,
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX secret key",
             "prompt_on_new": True,
+            "is_secure": True,
             "is_connect_key": True,
         },
     )
