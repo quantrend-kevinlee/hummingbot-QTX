@@ -19,11 +19,12 @@ from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase, build_trade_fee
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase, TradeFeeSchema
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.event.events import BuyOrderCompletedEvent, OrderFilledEvent, SellOrderCompletedEvent
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.model.trade_fill import TradeFill
@@ -133,6 +134,18 @@ class QtxExchange(ExchangePyBase):
         self.logger().info("Using simulated user stream data source.")
         return QTXAPIUserStreamDataSource()
 
+    def trade_fee_schema(self) -> TradeFeeSchema:
+        """
+        Return the fee schema for QTX.
+        Currently using Binance's fee structure as a placeholder until QTX provides its own fee endpoints.
+        """
+        # Use Binance's fee structure
+        from hummingbot.connector.exchange.binance.binance_utils import DEFAULT_FEES as BINANCE_DEFAULT_FEES
+
+        # When QTX implements its own fee structure, this method would be updated to use QTX-specific fees
+        # For now, we're using Binance's fee structure as requested
+        return BINANCE_DEFAULT_FEES
+
     def _get_fee(
         self,
         base_currency: str,
@@ -144,9 +157,13 @@ class QtxExchange(ExchangePyBase):
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
         """
-        Return a flat zero fee for market data only connector.
+        Calculate the fee for an order based on the fee schema.
+        Uses the same approach as Binance connector.
         """
-        return DeductedFromReturnsTradeFee(percent=Decimal("0"))
+        is_maker = order_type is OrderType.LIMIT_MAKER
+        fee_schema = self.trade_fee_schema()
+        fee_pct = fee_schema.maker_percent_fee_decimal if is_maker else fee_schema.taker_percent_fee_decimal
+        return DeductedFromReturnsTradeFee(percent=fee_pct)
 
     async def get_last_traded_price(self, trading_pair: str) -> float:
         """
@@ -554,8 +571,10 @@ class QtxExchange(ExchangePyBase):
                         self.logger().warning(f"Insufficient {quote_asset} balance for buy order {order_id}")
                         continue
 
-                    # Update balances
-                    fee_amount = fill_amount * Decimal("0.001")  # 0.1% fee
+                    # Calculate proper fee using the fee schema directly
+                    fee_schema = self.trade_fee_schema()
+                    fee_percent = fee_schema.taker_percent_fee_decimal  # Assuming taker fee for simulated fills
+                    fee_amount = fill_amount * fee_percent
                     self._account_balances[quote_asset] = quote_balance - quote_amount_needed
                     self._account_balances[base_asset] = base_balance + fill_amount - fee_amount
                     self._account_available_balances[quote_asset] = self._account_balances[quote_asset]
@@ -575,9 +594,11 @@ class QtxExchange(ExchangePyBase):
                         self.logger().warning(f"Insufficient {base_asset} balance for sell order {order_id}")
                         continue
 
-                    # Update balances
+                    # Update balances with proper fee calculation
                     quote_amount_received = fill_amount * fill_price
-                    fee_amount = quote_amount_received * Decimal("0.001")  # 0.1% fee
+                    fee_schema = self.trade_fee_schema()
+                    fee_percent = fee_schema.taker_percent_fee_decimal  # Assuming taker fee for simulated fills
+                    fee_amount = quote_amount_received * fee_percent
                     self._account_balances[base_asset] = base_balance - fill_amount
                     self._account_balances[quote_asset] = quote_balance + quote_amount_received - fee_amount
                     self._account_available_balances[base_asset] = self._account_balances[base_asset]
@@ -604,7 +625,11 @@ class QtxExchange(ExchangePyBase):
                 )
                 self._order_tracker.process_trade_update(trade_update)
 
-                # Create and emit order filled event
+                # Create and emit order filled event with proper fee structure
+                is_maker = order.order_type is OrderType.LIMIT_MAKER
+                fee_schema = self.trade_fee_schema()
+                fee_percent = fee_schema.maker_percent_fee_decimal if is_maker else fee_schema.taker_percent_fee_decimal
+
                 order_filled_event = OrderFilledEvent(
                     timestamp=self.current_timestamp,
                     order_id=order_id,
@@ -615,14 +640,14 @@ class QtxExchange(ExchangePyBase):
                     amount=fill_amount,
                     trade_fee=build_trade_fee(
                         self.name,
-                        is_maker=False,
+                        is_maker=is_maker,
                         base_currency=base_asset,
                         quote_currency=quote_asset,
                         order_type=order.order_type,
                         order_side=order.trade_type,
                         amount=fill_amount,
                         price=fill_price,
-                        fee_percent=Decimal("0.001"),  # 0.1% fee
+                        fee_percent=fee_percent,
                     ),
                     exchange_trade_id=trade_id,
                 )
@@ -847,16 +872,40 @@ class QtxExchange(ExchangePyBase):
 
     async def _update_trading_fees(self):
         """
-        Update trading fees.
-        Currently uses simulated values until fee endpoints are available.
+        Update trading fees from the exchange.
+        Currently using Binance's fee structure directly.
+
+        When QTX provides fee endpoints, this method will query the actual fee structure.
         """
-        self.logger().debug("Updating trading fees")
+        # FUTURE IMPLEMENTATION:
+        # When QTX implements fee endpoints, the code would look like this:
+        # try:
+        #     response = await self._api_request(
+        #         method=RESTMethod.GET,
+        #         path_url="api/v1/trading-fee",  # QTX endpoint for trading fees
+        #         is_auth_required=True
+        #     )
+        #     for fee_data in response:
+        #         symbol = fee_data["symbol"]
+        #         trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol)
+        #         maker_fee = Decimal(str(fee_data["makerCommission"]))
+        #         taker_fee = Decimal(str(fee_data["takerCommission"]))
+        #         self._trading_fees[trading_pair] = TradeFeeSchema(
+        #             maker_percent_fee_decimal=maker_fee,
+        #             taker_percent_fee_decimal=taker_fee,
+        #             buy_percent_fee_deducted_from_returns=True
+        #         )
+        # except Exception as e:
+        #     self.logger().error(f"Error fetching trading fees: {e}", exc_info=True)
+        #     # Fall back to default fees for all trading pairs
+
+        # CURRENT IMPLEMENTATION:
+        # For now, we're directly using Binance's fee structure
+        from hummingbot.connector.exchange.binance.binance_utils import DEFAULT_FEES as BINANCE_DEFAULT_FEES
+
+        # Apply Binance's fee structure to all trading pairs
         for trading_pair in self.trading_pairs:
-            # Create zero fee entries for all trading pairs
-            self._trading_fees[trading_pair] = {
-                "maker": Decimal("0.0"),
-                "taker": Decimal("0.0"),
-            }
+            self._trading_fees[trading_pair] = BINANCE_DEFAULT_FEES
 
     def c_tick(self, timestamp: float):
         """
