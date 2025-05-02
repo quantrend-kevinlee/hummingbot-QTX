@@ -7,33 +7,30 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, AsyncIterable, Dict, List, Optional, Tuple
 
-from bidict import bidict
-
 from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants as BINANCE_CONSTANTS
+from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative import BinancePerpetualDerivative
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.derivative.qtx_perpetual import (
     qtx_perpetual_constants as CONSTANTS,
-    qtx_perpetual_utils,
     qtx_perpetual_web_utils as web_utils,
 )
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_api_order_book_data_source import (
     QtxPerpetualAPIOrderBookDataSource,
 )
-from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_auth import QtxPerpetualAuth
+from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_auth import QtxPerpetualBinanceAuth
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_user_stream_data_source import (
     QtxPerpetualUserStreamDataSource,
 )
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -44,8 +41,8 @@ if TYPE_CHECKING:
 class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     """
     QtxPerpetualDerivative connects to the QTX UDP market data source for real-time market data.
-    Trading functionality is currently simulated until QTX provides order execution endpoints.
-    When QTX adds trading API endpoints, this connector can be updated to use them without changing the interface.
+    Trading functionality is delegated to Binance's API for order execution on the mainnet.
+    This hybrid approach leverages QTX's market data with Binance's order execution capabilities.
     """
 
     web_utils = web_utils
@@ -56,53 +53,82 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     def __init__(
         self,
         client_config_map: "ClientConfigAdapter",
-        qtx_perpetual_api_key: str = None,
-        qtx_perpetual_api_secret: str = None,
         qtx_perpetual_host: str = CONSTANTS.DEFAULT_UDP_HOST,
         qtx_perpetual_port: int = CONSTANTS.DEFAULT_UDP_PORT,
+        binance_api_key: str = None,  # Binance API key
+        binance_api_secret: str = None,  # Binance API secret
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
-        domain: str = CONSTANTS.DOMAIN,
+        domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
-        self.qtx_perpetual_api_key = qtx_perpetual_api_key
-        self.qtx_perpetual_secret_key = qtx_perpetual_api_secret
+        # QTX connection settings for market data
         self._qtx_perpetual_host = qtx_perpetual_host
         self._qtx_perpetual_port = qtx_perpetual_port
+
+        # Binance credentials for order execution (mainnet)
+        self.binance_api_key = binance_api_key
+        self.binance_api_secret = binance_api_secret
+
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._domain = domain
-        self._position_mode = PositionMode.ONEWAY  # Default position mode
-        self._leverage = defaultdict(lambda: Decimal("1"))  # Default leverage is 1x
         self._funding_payment_span = CONSTANTS.FUNDING_SETTLEMENT_DURATION
-        self._last_trade_history_timestamp = None
 
-        # Internal state for orders and trades (simulated until API endpoints are available)
-        self._orders_cache: Dict[str, Dict[str, Any]] = {}
-        self._trades_cache: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # Initialize state for position tracking and funding info
         self._positions_cache: Dict[str, Dict[PositionSide, Position]] = defaultdict(dict)
-        self._next_trade_id = 0  # Initialize trade ID counter
-
-        # Initialize funding info
         self._funding_info = {}
-        self._funding_info_stream = None
 
+        # Warm-up related variables
+        self._ready = False
+        self._warm_up_start_time = 0
+
+        # Initialize the base class
         super().__init__(client_config_map)
 
-    async def _make_trading_pairs_request(self) -> Optional[Dict[str, Any]]:
+        # Initialize Binance connector AFTER super().__init__ to ensure throttler is created
+        self._binance_derivative = None
+        if trading_required and binance_api_key and binance_api_secret:
+            self._init_binance_connector()
+
+    def _init_binance_connector(self):
         """
-        Override the base class method to prevent REST API call for trading pairs.
-        Returns None as the actual mapping is handled by
-        _initialize_trading_pair_symbols_from_exchange_info based on configured pairs.
+        Initialize the Binance connector for order execution delegation
         """
-        return None
-        
+        self._binance_derivative = BinancePerpetualDerivative(
+            client_config_map=self._client_config,
+            binance_perpetual_api_key=self.binance_api_key,
+            binance_perpetual_api_secret=self.binance_api_secret,
+            trading_pairs=self._trading_pairs,
+            trading_required=self._trading_required,
+            domain=self._domain
+        )
+        # Share the throttler to coordinate rate limiting
+        self._binance_derivative._throttler = self._throttler
+
+    @property
+    def _binance_connector(self) -> BinancePerpetualDerivative:
+        """
+        Returns the Binance connector instance, initializing it if necessary
+        """
+        if self._binance_derivative is None and self._trading_required:
+            if self.binance_api_key and self.binance_api_secret:
+                self._init_binance_connector()
+            else:
+                raise ValueError("Binance API credentials required for trading")
+        return self._binance_derivative
+
     @property
     def name(self) -> str:
         return CONSTANTS.EXCHANGE_NAME
 
     @property
-    def authenticator(self) -> QtxPerpetualAuth:
-        return QtxPerpetualAuth(self.qtx_perpetual_api_key, self.qtx_perpetual_secret_key, self._time_synchronizer)
+    def authenticator(self) -> QtxPerpetualBinanceAuth:
+        # Only need Binance authentication, QTX market data doesn't require auth
+        return QtxPerpetualBinanceAuth(
+            binance_api_key=self.binance_api_key,
+            binance_api_secret=self.binance_api_secret,
+            time_provider=self._time_synchronizer
+        )
 
     @property
     def rate_limits_rules(self) -> List[RateLimit]:
@@ -122,28 +148,57 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def trading_rules_request_path(self) -> str:
-        return CONSTANTS.EXCHANGE_INFO_PATH_URL
+        return BINANCE_CONSTANTS.EXCHANGE_INFO_URL
 
     @property
     def trading_pairs_request_path(self) -> str:
-        return CONSTANTS.EXCHANGE_INFO_PATH_URL
+        return BINANCE_CONSTANTS.EXCHANGE_INFO_URL
 
     @property
     def check_network_request_path(self) -> str:
-        return CONSTANTS.PING_PATH_URL
-        
+        return BINANCE_CONSTANTS.PING_URL
+
+    @property
+    def ready(self) -> bool:
+        """
+        Checks if the connector is ready for trading.
+        Returns True if:
+        1. All markets are ready
+        2. The warm-up period has elapsed (preventing trading during orderbook initialization)
+        """
+        # Check if the base class implementation is ready
+        base_ready = super().ready
+
+        # If base ready, also check if the warm-up period has elapsed
+        if base_ready and not self._ready:
+            # Check if warm-up period has elapsed
+            if self._warm_up_start_time > 0 and time.time() >= self._warm_up_start_time + CONSTANTS.ORDERBOOK_WARMUP_TIME:
+                self.logger().info("QTX Perpetual connector warm-up period completed.")
+                self._ready = True
+
+        return base_ready and self._ready
+
     async def check_network(self) -> NetworkStatus:
         """
-        Checks UDP connectivity to the QTX feed.
+        Checks UDP connectivity to the QTX feed and Binance API if trading is required
         """
         try:
+            # Check QTX UDP connection
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(1.0)
             sock.sendto(b"", (self._qtx_perpetual_host, self._qtx_perpetual_port))
             sock.close()
+
+            # Check Binance connection if trading is required
+            if self._trading_required:
+                binance_status = await self._binance_connector.check_network()
+                if binance_status != NetworkStatus.CONNECTED:
+                    self.logger().warning("Binance API connection check failed")
+                    return NetworkStatus.NOT_CONNECTED
+
             return NetworkStatus.CONNECTED
         except Exception as e:
-            self.logger().warning(f"UDP network check failed: {e}")
+            self.logger().warning(f"Network check failed: {e}")
             return NetworkStatus.NOT_CONNECTED
 
     @property
@@ -161,102 +216,43 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def funding_fee_poll_interval(self) -> int:
         return 600  # 10 minutes
-        
-    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+
+    # Market data methods (use QTX implementation)
+    def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """
-        Retrieves all trade updates for a specific order from the trades cache
-        Returns a list of TradeUpdate objects
+        Create the order book tracker data source using QTX
         """
-        client_order_id = order.client_order_id
-        trades = []
-        
-        # Get trade updates from the internal cache
-        for trade in self._trades_cache.get(client_order_id, []):
-            trades.append(
-                TradeUpdate(
-                    trade_id=trade["id"],
-                    client_order_id=client_order_id,
-                    exchange_order_id=trade["order_id"],
-                    trading_pair=order.trading_pair,
-                    fee=TradeFeeBase.new_spot_fee(
-                        fee_schema=self.trade_fee_schema(),
-                        trade_type=order.trade_type,
-                        percent=trade.get("fee_percent", Decimal("0")),
-                        flat_fees=[TokenAmount(
-                            trade.get("fee_asset", "USDT"),
-                            Decimal(trade.get("fee_amount", "0"))
-                        )]
-                    ),
-                    fill_base_amount=Decimal(trade["amount"]),
-                    fill_quote_amount=Decimal(trade["amount"]) * Decimal(trade["price"]),
-                    fill_price=Decimal(trade["price"]),
-                    fill_timestamp=trade["timestamp"],
-                )
-            )
-        
-        return trades
-    
-    async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal]:
+        return QtxPerpetualAPIOrderBookDataSource(
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            domain=self.domain,
+            host=self._qtx_perpetual_host,
+            port=self._qtx_perpetual_port,
+        )
+
+    # User stream methods (use Binance implementation through delegation)
+    def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         """
-        Simulates fetching the last funding fee payment
-        Returns the timestamp and amount of the last funding fee payment
+        Create the user stream data source
+        This uses the Binance stream for order/position updates
         """
-        last_timestamp = self._last_funding_fee_payment_ts.get(trading_pair, 0)
-        return last_timestamp, Decimal("0")  # For simulation, return 0 funding fee
-    
-    def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> Dict[str, TradingRule]:
-        """
-        Creates trading rules from exchange info for all available trading pairs
-        Returns a dictionary of trading pair to TradingRule
-        """
-        trading_rules = {}
-        
-        # Create simulated trading rules with standard values
-        for trading_pair in self._trading_pairs or []:
-            trading_rules[trading_pair] = TradingRule(
-                trading_pair=trading_pair,
-                min_order_size=Decimal("0.001"),
-                min_price_increment=Decimal("0.01"),
-                min_base_amount_increment=Decimal("0.001"),
-                min_notional_size=Decimal("10"),
-                max_order_size=Decimal("1000"),
-            )
-        
-        return trading_rules
-    
-    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]) -> None:
-        """
-        Initialize trading pair symbols directly from the configured list.
-        The exchange_info parameter is ignored since we're not querying an actual exchange.
-        """
-        self._trading_pair_symbol_map = {}
-        self._symbol_trading_pair_map = {}
-        
-        # Use the trading_pairs property to ensure we have valid pairs
-        pairs_to_map = self._trading_pairs or []
-        
-        for trading_pair in pairs_to_map:
-            # Convert to exchange symbol format (e.g., 'binance-futures:btcusdt')
-            exchange_symbol = qtx_perpetual_utils.convert_to_exchange_trading_pair(trading_pair)
-            self._trading_pair_symbol_map[trading_pair] = exchange_symbol
-            self._symbol_trading_pair_map[exchange_symbol] = trading_pair
-            
-        # Initialize simulated trading rules
-        self._trading_rules.clear()
-        self._trading_rules = self._format_trading_rules({})
-    
+        return QtxPerpetualUserStreamDataSource(
+            auth=self._auth,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            domain=self.domain,
+        )
+
+    # All trading methods delegate to Binance connector
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         """
-        Simulates order cancellation by updating the order status in the internal cache
-        Returns whether the cancellation was successful
+        Delegate order cancellation to Binance connector
         """
-        if order_id not in self._orders_cache:
-            return False
-        
-        # Update order status to CANCELED
-        self._orders_cache[order_id]["status"] = "CANCELED"
-        return True
-    
+        if self._trading_required:
+            return await self._binance_connector._place_cancel(order_id, tracked_order)
+        return False
+
     async def _place_order(
         self,
         order_id: str,
@@ -269,242 +265,200 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         **kwargs,
     ) -> Tuple[str, float]:
         """
-        Simulates order placement by creating an order in the internal cache
-        Returns the exchange order ID and the timestamp of order creation
+        Delegate order placement to Binance connector
         """
-        timestamp = self.current_timestamp
-        exchange_order_id = f"s-{order_id}"  # prefix with 's-' to indicate simulated
-        
-        # Simulate order placement in internal cache
-        self._orders_cache[order_id] = {
-            "id": exchange_order_id,
-            "client_order_id": order_id,
-            "trading_pair": trading_pair,
-            "amount": amount,
-            "trade_type": trade_type,
-            "order_type": order_type,
-            "price": price,
-            "position_action": position_action,
-            "status": "NEW",
-            "created_time": timestamp,
-        }
-        
-        # Return simulated exchange order ID and timestamp
-        return exchange_order_id, timestamp
-    
+        if self._trading_required:
+            return await self._binance_connector._place_order(
+                order_id=order_id,
+                trading_pair=trading_pair,
+                amount=amount,
+                trade_type=trade_type,
+                order_type=order_type,
+                price=price,
+                position_action=position_action,
+                **kwargs
+            )
+        return "", 0.0
+
+    async def _update_trading_rules(self):
+        """
+        Delegate trading rules update to Binance connector
+        """
+        if self._trading_required:
+            await self._binance_connector._update_trading_rules()
+            self._trading_rules = self._binance_connector._trading_rules
+        else:
+            self._trading_rules = {}
+
+    async def _update_balances(self):
+        """
+        Retrieve balances from Binance API
+        This method will attempt to get balances regardless of trading_required flag
+        """
+
+        try:
+            # Ensure Binance connector is initialized and working (if we have credentials)
+            if self.binance_api_key and self.binance_api_secret:
+                if self._binance_derivative is None:
+                    self._init_binance_connector()
+
+                # Log domain and URL information
+                self.logger().debug(f"Fetching balance from Binance API using domain: {self._domain}")
+
+                # Directly update balances from Binance API
+                account_info = await self._api_get(
+                    path_url=BINANCE_CONSTANTS.ACCOUNT_INFO_URL,
+                    is_auth_required=True,
+                    limit_id=BINANCE_CONSTANTS.ACCOUNT_INFO_URL
+                )
+
+                # Log the structure of account_info for debugging
+                self.logger().debug(f"Account info keys: {account_info.keys() if isinstance(account_info, dict) else 'Not a dict'}")
+
+                # Process the balances from the account info
+                if "assets" in account_info:
+                    assets = account_info.get("assets", [])
+                    self.logger().debug(f"Received {len(assets)} assets from Binance")
+
+                    # For debugging, log a sample asset if available
+                    if len(assets) > 0:
+                        self.logger().debug(f"Sample asset structure: {assets[0]}")
+
+                    local_asset_names = set(self._account_balances.keys())
+                    remote_asset_names = set()
+
+                    for asset in assets:
+                        asset_name = asset.get("asset")
+
+                        # Skip assets with zero balance
+                        wallet_balance = Decimal(str(asset.get("walletBalance", "0")))
+                        if wallet_balance == Decimal("0"):
+                            continue
+
+                        available_balance = Decimal(str(asset.get("availableBalance", "0")))
+
+                        self.logger().debug(f"Processing asset: {asset_name}, wallet: {wallet_balance}, available: {available_balance}")
+
+                        self._account_available_balances[asset_name] = available_balance
+                        self._account_balances[asset_name] = wallet_balance
+                        remote_asset_names.add(asset_name)
+
+                    # Log updated balances - Keep this as INFO since it's important
+                    non_zero_balances = {k: v for k, v in self._account_balances.items() if v > 0}
+                    if non_zero_balances:
+                        self.logger().info(f"Updated balances: {', '.join([f'{k}: {v}' for k, v in non_zero_balances.items()])}")
+                    else:
+                        self.logger().debug("No non-zero balances found")
+
+                    # Remove any assets no longer present
+                    asset_names_to_remove = local_asset_names.difference(remote_asset_names)
+                    for asset_name in asset_names_to_remove:
+                        del self._account_available_balances[asset_name]
+                        del self._account_balances[asset_name]
+                else:
+                    self.logger().error(f"Error updating balances: account_info does not contain 'assets' key. Keys: {account_info.keys()}")
+            else:
+                self.logger().debug("Skipping balance update: Binance API credentials not provided")
+                self._account_balances = {}
+                self._account_available_balances = {}
+        except Exception as e:
+            # Log the error but don't crash
+            self.logger().error(f"Error updating balances: {str(e)}", exc_info=True)
+            # Set empty balances on error
+            self._account_balances = {}
+            self._account_available_balances = {}
+
+    async def _update_positions(self):
+        """
+        Delegate position updates to Binance connector
+        """
+        if self._trading_required:
+            await self._binance_connector._update_positions()
+            # Copy positions from Binance to our local cache
+            for trading_pair, positions in self._binance_connector._perpetual_trading._positions.items():
+                for position_side, position in positions.items():
+                    self._perpetual_trading.set_position(
+                        self._perpetual_trading.position_key(trading_pair, position_side),
+                        position
+                    )
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
-        Simulates order status request by retrieving the order from internal cache
-        Returns an OrderUpdate object with the current status
+        Delegate order status request to Binance connector
         """
-        client_order_id = tracked_order.client_order_id
-        
-        if client_order_id not in self._orders_cache:
-            return OrderUpdate(
-                client_order_id=client_order_id,
-                exchange_order_id=None,
-                trading_pair=tracked_order.trading_pair,
-                update_timestamp=self.current_timestamp,
-                new_state=OrderState.FAILED,
-            )
-        
-        cached_order = self._orders_cache[client_order_id]
-        state = CONSTANTS.ORDER_STATE.get(cached_order["status"], OrderState.OPEN)
-        
+        if self._trading_required:
+            return await self._binance_connector._request_order_status(tracked_order)
         return OrderUpdate(
-            client_order_id=client_order_id,
-            exchange_order_id=cached_order["id"],
-            trading_pair=cached_order["trading_pair"],
+            trading_pair=tracked_order.trading_pair,
             update_timestamp=self.current_timestamp,
-            new_state=state,
+            new_state=tracked_order.current_state,
+            client_order_id=tracked_order.client_order_id,
         )
-    
-    async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
-        """
-        Simulates setting the leverage for a trading pair
-        Returns whether the operation was successful and an error message if any
-        """
-        self._leverage[trading_pair] = Decimal(str(leverage))
-        return True, ""
-    
-    async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
-        """
-        Simulates setting the position mode for a trading pair
-        Returns whether the operation was successful and an error message if any
-        """
-        self._position_mode = mode
-        return True, ""
-    
-    async def _update_trading_fees(self):
-        """
-        Updates the trading fees for all trading pairs
-        This is a simulated implementation that sets standard fees
-        """
-        for trading_pair in self._trading_pairs or []:
-            # Standard maker/taker fees
-            self._trading_fees[trading_pair] = TradeFeeBase.new_spot_fee(
-                fee_schema=self.trade_fee_schema(),
-                trade_type=TradeType.BUY,
-                percent=Decimal("0.0004"),  # 0.04% taker fee
-            )
-    
-    async def _user_stream_event_listener(self):
-        """
-        Simulates the user stream event listener by processing market updates
-        This is now a lightweight implementation that doesn't directly process fills
-        """
-        self.logger().info("Starting user stream event listener")
-        while True:
-            try:
-                # Just simulate a lightweight user stream connection
-                # This should not be doing heavy processing
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                self.logger().info("User stream event listener cancelled")
-                raise
-            except Exception as e:
-                self.logger().error(f"Unexpected error in user stream listener: {e}", exc_info=True)
-                await asyncio.sleep(5.0)
-    
-    def _should_fill_order(self, order: InFlightOrder) -> bool:
-        """
-        Helper method to determine if an order should be filled in simulation
-        For now, randomly fill orders with a 20% chance each check
-        
-        :param order: The InFlightOrder to check
-        :return: True if the order should be filled, False otherwise
-        """
-        import random
-        return random.random() < 0.2  # 20% chance to fill an order
-    
-    async def _simulate_order_fills(self):
-        """
-        Simulates order fills based on current market data.
-        This method is called periodically to check if any open orders should be filled.
-        Similar to the spot connector's approach, this runs in a separate task to avoid blocking
-        the user stream listener.
-        """
-        while True:
-            try:
-                if not self._in_flight_orders:
-                    await asyncio.sleep(1)  # No open orders to process
-                    continue
-                    
-                # Process each open order
-                for order_id, order in list(self._in_flight_orders.items()):
-                    # Skip orders that are not in OPEN state
-                    if order.current_state != OrderState.OPEN:
-                        continue
-                    
-                    # Check if the order should be filled
-                    if self._should_fill_order(order):
-                        # Schedule order fill with a small delay
-                        self.schedule_async_call(
-                            self._simulate_order_fill(order_id, order.amount, order.price), 
-                            0.1  # Small delay to simulate network latency
-                        )
-                        
-                # Sleep before next check
-                await asyncio.sleep(2)  # Check every 2 seconds, adjust as needed
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().error(f"Error in order fill simulation: {e}", exc_info=True)
-                await asyncio.sleep(5.0)  # Longer delay on error
-    
-    def _process_order_update(self, order_id: str, order_data: Dict[str, Any]) -> None:
-        """
-        Process order updates and notify the hummingbot client
-        """
-        # This would be implemented to update the order tracker and emit events
-        # For now, just log the update
-        self.logger().info(f"Order update: {order_id} - {order_data['status']}")
 
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        """
+        Delegate trade updates request to Binance connector
+        """
+        if self._trading_required:
+            return await self._binance_connector._all_trade_updates_for_order(order)
+        return []
+
+    async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
+        """
+        Delegate fee payment request to Binance connector
+        """
+        if self._trading_required:
+            return await self._binance_connector._fetch_last_fee_payment(trading_pair)
+        return 0, Decimal("-1"), Decimal("-1")
+
+    # Order type and position mode support
     def supported_order_types(self) -> List[OrderType]:
         """
-        :return a list of OrderType supported by this connector
+        Returns order types supported by the connector
         """
         return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
     def supported_position_modes(self):
         """
-        This method needs to be overridden to provide the accurate information depending on the exchange.
+        Returns supported position modes
         """
         return [PositionMode.ONEWAY, PositionMode.HEDGE]
 
+    # Set leverage and position mode (delegate to Binance)
+    async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
+        """
+        Delegate leverage setting to Binance connector
+        """
+        if self._trading_required:
+            return await self._binance_connector._set_trading_pair_leverage(trading_pair, leverage)
+        return False, "Trading not enabled"
+
+    async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
+        """
+        Delegate position mode setting to Binance connector
+        """
+        if self._trading_required:
+            return await self._binance_connector._trading_pair_position_mode_set(mode, trading_pair)
+        return False, "Trading not enabled"
+
+    # Fees and trading info
     def get_buy_collateral_token(self, trading_pair: str) -> str:
         """
-        Returns the token used as collateral for buying
+        Returns the collateral token for buy orders
         """
-        trading_rule: TradingRule = self._trading_rules[trading_pair]
-        return trading_rule.buy_order_collateral_token
+        if self._trading_required and trading_pair in self._trading_rules:
+            return self._trading_rules[trading_pair].buy_order_collateral_token
+        base, quote = trading_pair.split("-")
+        return quote
 
     def get_sell_collateral_token(self, trading_pair: str) -> str:
         """
-        Returns the token used as collateral for selling
+        Returns the collateral token for sell orders
         """
-        trading_rule: TradingRule = self._trading_rules[trading_pair]
-        return trading_rule.sell_order_collateral_token
-
-    def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
-        """
-        Checks if the request exception is related to time synchronization
-        """
-        error_description = str(request_exception)
-        is_time_synchronizer_related = (
-            "-1021" in error_description and "Timestamp for this request" in error_description
-        )
-        return is_time_synchronizer_related
-
-    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        """
-        Checks if the exception is due to order not found during status update
-        """
-        return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
-            status_update_exception
-        ) and CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
-
-    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        """
-        Checks if the exception is due to order not found during cancelation
-        """
-        return str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in str(
-            cancelation_exception
-        ) and CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
-
-    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
-        """
-        Creates a minimal web assistants factory to satisfy status checks.
-        This matches the approach used in the QTX spot connector.
-        """
-        # Create a throttler if it doesn't exist
-        if self._throttler is None:
-            self._throttler = AsyncThrottler(rate_limits=[])
-            
-        # Don't use the time synchronizer to avoid errors
-        return WebAssistantsFactory(throttler=self._throttler, auth=self._auth)
-
-    def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
-        """
-        Creates the order book data source
-        """
-        return QtxPerpetualAPIOrderBookDataSource(
-            trading_pairs=self._trading_pairs,
-            connector=self,
-            api_factory=self._web_assistants_factory,
-            domain=self.domain,
-        )
-
-    def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
-        """
-        Creates the user stream data source
-        """
-        return QtxPerpetualUserStreamDataSource(
-            auth=self._auth,
-            connector=self,
-            api_factory=self._web_assistants_factory,
-            domain=self.domain,
-        )
+        if self._trading_required and trading_pair in self._trading_rules:
+            return self._trading_rules[trading_pair].sell_order_collateral_token
+        base, quote = trading_pair.split("-")
+        return quote
 
     def _get_fee(
         self,
@@ -517,11 +471,8 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         price: Decimal = s_decimal_NaN,
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
-        """
-        Calculate the fee for an order
-        """
-        is_maker = order_type is OrderType.LIMIT_MAKER
-        fee = build_trade_fee(
+        is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
+        return build_trade_fee(
             self.name,
             is_maker,
             base_currency=base_currency,
@@ -531,944 +482,306 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             amount=amount,
             price=price,
         )
-        return fee
 
-    async def _update_trading_rules(self):
-        """
-        Update trading rules from the exchange
-        """
-        # Simulate trading rules for all trading pairs
-        self._trading_rules.clear()
-
-        for trading_pair in self._trading_pairs:
-            # Extract base and quote from trading pair
-            base, quote = trading_pair.split("-")
-
-            # Create simulated trading rule
-            self._trading_rules[trading_pair] = TradingRule(
-                trading_pair=trading_pair,
-                min_order_size=Decimal("0.001"),
-                min_price_increment=Decimal("0.01"),
-                min_base_amount_increment=Decimal("0.001"),
-                min_quote_amount_increment=Decimal("0.01"),
-                min_notional_size=Decimal("1"),
-                max_order_size=Decimal("1000"),
-                supports_market_orders=True,
-                buy_order_collateral_token=quote,
-                sell_order_collateral_token=quote,
-            )
-
-    async def _update_balances(self):
-        """
-        Update account balances (simulated)
-        """
-        # Simulate account balances for all trading pairs
-        for trading_pair in self._trading_pairs:
-            base, quote = trading_pair.split("-")
-
-            # Initialize balances if not already present
-            if base not in self._account_balances:
-                self._account_balances[base] = Decimal("100")  # Simulated base balance
-                self._account_available_balances[base] = Decimal("100")
-
-            if quote not in self._account_balances:
-                self._account_balances[quote] = Decimal("10000")  # Simulated quote balance
-                self._account_available_balances[quote] = Decimal("10000")
-
-    async def _update_positions(self):
-        """
-        Update positions (simulated)
-        """
-        # Simulate positions for all trading pairs
-        for trading_pair in self._trading_pairs:
-            if trading_pair not in self._positions_cache:
-                # Initialize with empty positions
-                if self._position_mode == PositionMode.ONEWAY:
-                    # One-way mode has only BOTH position side
-                    self._positions_cache[trading_pair][PositionSide.BOTH] = Position(
-                        trading_pair=trading_pair,
-                        position_side=PositionSide.BOTH,
-                        unrealized_pnl=Decimal("0"),
-                        entry_price=Decimal("0"),
-                        amount=Decimal("0"),
-                        leverage=self._leverage[trading_pair],
-                    )
-                else:
-                    # Hedge mode has LONG and SHORT position sides
-                    self._positions_cache[trading_pair][PositionSide.LONG] = Position(
-                        trading_pair=trading_pair,
-                        position_side=PositionSide.LONG,
-                        unrealized_pnl=Decimal("0"),
-                        entry_price=Decimal("0"),
-                        amount=Decimal("0"),
-                        leverage=self._leverage[trading_pair],
-                    )
-                    self._positions_cache[trading_pair][PositionSide.SHORT] = Position(
-                        trading_pair=trading_pair,
-                        position_side=PositionSide.SHORT,
-                        unrealized_pnl=Decimal("0"),
-                        entry_price=Decimal("0"),
-                        amount=Decimal("0"),
-                        leverage=self._leverage[trading_pair],
-                    )
-
-    async def _update_funding_info(self):
-        """
-        Update funding information (simulated)
-        """
-        # Simulate funding info for all trading pairs
-        for trading_pair in self._trading_pairs:
-            current_time = int(time.time() * 1000)
-            next_funding_time = current_time + 8 * 3600 * 1000  # 8 hours from now
-
-            self._funding_info[trading_pair] = {
-                "indexPrice": Decimal("10000"),  # Simulated index price
-                "markPrice": Decimal("10000"),  # Simulated mark price
-                "nextFundingTime": next_funding_time,
-                "fundingRate": Decimal("0.0001"),  # Simulated funding rate (0.01%)
-            }
-
-    async def _status_polling_loop(self):
-        """
-        Periodically update trading rules, balances, positions, and funding info
-        """
-        while True:
+    # User stream event processing - delegate to Binance connector
+    async def _user_stream_event_listener(self):
+        async for event_message in self._iter_user_event_queue():
             try:
-                await self._update_trading_rules()
-                await self._update_balances()
-                await self._update_positions()
-                await self._update_funding_info()
-
-                # Sleep before next update
-                await asyncio.sleep(self.SHORT_POLL_INTERVAL)
+                event_type = event_message.get("e")
+                if event_type == "ORDER_TRADE_UPDATE":
+                    # Process order update
+                    await self._process_user_stream_order_update(event_message)
+                elif event_type == "ACCOUNT_UPDATE":
+                    # Process account update
+                    await self._process_user_stream_account_update(event_message)
+                elif event_type == "MARGIN_CALL":
+                    # Process margin call
+                    await self._process_user_stream_margin_call(event_message)
+                elif event_type == "ACCOUNT_CONFIG_UPDATE":
+                    # Process account config update
+                    await self._process_user_stream_config_update(event_message)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger().error(f"Error in status polling loop: {e}", exc_info=True)
-                await asyncio.sleep(5.0)
+                self.logger().error(f"Unexpected error in user stream listener loop: {e}", exc_info=True)
+                await self._sleep(5.0)
 
-    async def _trading_rules_polling_loop(self):
-        """
-        Periodically update trading rules
-        """
-        while True:
-            try:
-                await self._update_trading_rules()
-                await asyncio.sleep(60)  # Update every minute
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().error(f"Error updating trading rules: {e}", exc_info=True)
-                await asyncio.sleep(5.0)
+    async def _process_user_stream_order_update(self, event_message: Dict[str, Any]):
+        order_message = event_message.get("o")
+        if order_message:
+            client_order_id = order_message.get("c", None)
+            tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
+            if tracked_order is not None:
+                # Process trade update if applicable
+                trade_id = str(order_message["t"])
+                if trade_id != "0":  # Indicates there has been a trade
+                    await self._process_trade_update_from_order_message(tracked_order, order_message)
 
-    async def _create_order(
-        self,
-        trade_type: TradeType,
-        order_id: str,
-        trading_pair: str,
-        amount: Decimal,
-        order_type: OrderType,
-        price: Decimal,
-        position_action: PositionAction = PositionAction.OPEN,
-        **kwargs,
-    ) -> Tuple[str, float]:
-        """
-        Create a simulated order
-        """
-        exchange_order_id = f"s-{order_id}"  # Simulated exchange order ID
+                # Process order status update
+                order_update = OrderUpdate(
+                    trading_pair=tracked_order.trading_pair,
+                    update_timestamp=event_message["T"] * 1e-3,
+                    new_state=BINANCE_CONSTANTS.ORDER_STATE[order_message["X"]],
+                    client_order_id=client_order_id,
+                    exchange_order_id=str(order_message["i"]),
+                )
+                self._order_tracker.process_order_update(order_update)
 
-        # Store order in cache
-        self._orders_cache[order_id] = {
-            "id": order_id,
-            "exchange_order_id": exchange_order_id,
-            "trading_pair": trading_pair,
-            "type": order_type,
-            "trade_type": trade_type,
-            "price": price,
-            "amount": amount,
-            "executed_amount": Decimal("0"),
-            "status": "NEW",
-            "created_time": time.time(),
-            "position_action": position_action,
-        }
+    async def _process_trade_update_from_order_message(self, tracked_order: InFlightOrder, order_message: Dict[str, Any]):
+        trade_id = str(order_message["t"])
+        client_order_id = tracked_order.client_order_id
 
-        # Simulate immediate fill for market orders
-        if order_type is OrderType.MARKET:
-            # Schedule order fill
-            self.schedule_async_call(
-                self._simulate_order_fill(order_id, amount, price), 0.1  # Small delay to simulate network latency
-            )
+        fee_asset = order_message.get("N", tracked_order.quote_asset)
+        fee_amount = Decimal(order_message.get("n", "0"))
+        position_side = order_message.get("ps", "LONG")
+        position_action = (PositionAction.OPEN
+                           if (tracked_order.trade_type is TradeType.BUY and position_side == "LONG"
+                               or tracked_order.trade_type is TradeType.SELL and position_side == "SHORT")
+                           else PositionAction.CLOSE)
+        flat_fees = [] if fee_amount == Decimal("0") else [TokenAmount(amount=fee_amount, token=fee_asset)]
 
-        # Return simulated exchange order ID and timestamp
-        return exchange_order_id, time.time()
-
-    async def _simulate_order_fill(self, order_id: str, amount: Decimal, price: Decimal):
-        """
-        Simulate order fill
-        """
-        self.logger().debug(f"Starting to simulate fill for order {order_id}")
-        if order_id not in self._orders_cache:
-            self.logger().debug(f"Order {order_id} not found in orders cache, cannot fill")
-            return
-
-        order = self._orders_cache[order_id]
-        trading_pair = order["trading_pair"]
-        trade_type = order["trade_type"]
-        position_action = order["position_action"]
-
-        # Update order status
-        self.logger().debug(f"Updating order {order_id} status to FILLED")
-        order["status"] = "FILLED"
-        order["executed_amount"] = amount
-
-        # Create trade update
-        self._next_trade_id += 1
-        trade_id = str(self._next_trade_id)
-        self.logger().debug(f"Created trade ID {trade_id} for order {order_id}")
-
-        # Store trade in cache
-        self.logger().debug(f"Creating trade record for order {order_id}")
-        trade = {
-            "id": trade_id,
-            "order_id": order_id,
-            "trading_pair": trading_pair,
-            "trade_type": trade_type,
-            "price": price,
-            "amount": amount,
-            "trade_fee": self._get_fee(
-                base_currency=trading_pair.split("-")[0],
-                quote_currency=trading_pair.split("-")[1],
-                order_type=order["type"],
-                order_side=trade_type,
-                position_action=position_action,
-                amount=amount,
-                price=price,
-            ),
-            "exchange_trade_id": f"t-{trade_id}",
-            "timestamp": time.time(),
-        }
-
-        self.logger().debug(f"Adding trade to cache for order {order_id}")
-        self._trades_cache[order_id].append(trade)
-
-        # Update positions
-        self.logger().debug(f"Updating position for {trading_pair} from fill")
-        try:
-            await self._update_position_from_fill(
-            trading_pair=trading_pair,
-            position_side=self._get_position_side(trade_type, position_action),
-            amount=amount,
-            price=price,
-            trade_type=trade_type,
+        fee = TradeFeeBase.new_perpetual_fee(
+            fee_schema=self.trade_fee_schema(),
             position_action=position_action,
-            )
-            self.logger().debug(f"Position update completed for {trading_pair}")
-        except Exception as e:
-            self.logger().error(f"Error updating position: {e}", exc_info=True)
-
-        # Trigger order update
-        self.logger().debug(f"Creating order update for {order_id}")
-        order_update = OrderUpdate(
-            client_order_id=order_id,
-            exchange_order_id=order["exchange_order_id"],
-            trading_pair=trading_pair,
-            update_timestamp=time.time(),
-            new_state=OrderState.FILLED,
+            percent_token=fee_asset,
+            flat_fees=flat_fees,
         )
 
-        # Trigger trade update
-        self.logger().debug(f"Creating trade update for {order_id}")
         trade_update = TradeUpdate(
             trade_id=trade_id,
-            client_order_id=order_id,
-            exchange_order_id=order["exchange_order_id"],
-            trading_pair=trading_pair,
-            fee=trade["trade_fee"],
-            fill_base_amount=amount,
-            fill_quote_amount=amount * price,
-            fill_price=price,
-            fill_timestamp=time.time(),
+            client_order_id=client_order_id,
+            exchange_order_id=str(order_message["i"]),
+            trading_pair=tracked_order.trading_pair,
+            fill_timestamp=order_message["T"] * 1e-3,
+            fill_price=Decimal(order_message["L"]),
+            fill_base_amount=Decimal(order_message["l"]),
+            fill_quote_amount=Decimal(order_message["L"]) * Decimal(order_message["l"]),
+            fee=fee,
         )
+        self._order_tracker.process_trade_update(trade_update)
 
-        # Emit events
-        self.logger().debug(f"Processing order update for {order_id}")
-        try:
-            self._order_tracker.process_order_update(order_update)
-            self.logger().debug(f"Order update processed for {order_id}")
-        except Exception as e:
-            self.logger().error(f"Error processing order update: {e}", exc_info=True)
-            
-        self.logger().debug(f"Processing trade update for {order_id}")
-        try:
-            self._order_tracker.process_trade_update(trade_update)
-            self.logger().debug(f"Trade update processed for {order_id}")
-        except Exception as e:
-            self.logger().error(f"Error processing trade update: {e}", exc_info=True)
-            
-        self.logger().debug(f"Completed simulating fill for order {order_id}")
+    async def _process_user_stream_account_update(self, event_message: Dict[str, Any]):
+        update_data = event_message.get("a", {})
 
-    def _get_position_side(self, trade_type: TradeType, position_action: PositionAction) -> PositionSide:
-        """
-        Determine position side based on trade type and position action
-        """
-        if self._position_mode == PositionMode.ONEWAY:
-            return PositionSide.BOTH
+        # Update balances
+        for asset in update_data.get("B", []):
+            asset_name = asset["a"]
+            self._account_balances[asset_name] = Decimal(asset["wb"])
+            self._account_available_balances[asset_name] = Decimal(asset["cw"])
 
-        # Hedge mode
-        if position_action == PositionAction.OPEN:
-            if trade_type == TradeType.BUY:
-                return PositionSide.LONG
-            else:
-                return PositionSide.SHORT
-        else:  # CLOSE
-            if trade_type == TradeType.BUY:
-                return PositionSide.SHORT  # Buy to close short
-            else:
-                return PositionSide.LONG  # Sell to close long
-
-    async def _update_position_from_fill(
-        self,
-        trading_pair: str,
-        position_side: PositionSide,
-        amount: Decimal,
-        price: Decimal,
-        trade_type: TradeType,
-        position_action: PositionAction,
-    ):
-        """
-        Update position based on order fill
-        """
-        if trading_pair not in self._positions_cache or position_side not in self._positions_cache[trading_pair]:
-            # Initialize position if not exists
-            self._positions_cache[trading_pair][position_side] = Position(
-                trading_pair=trading_pair,
-                position_side=position_side,
-                unrealized_pnl=Decimal("0"),
-                entry_price=price,
-                amount=Decimal("0"),
-                leverage=self._leverage[trading_pair],
-            )
-
-        position = self._positions_cache[trading_pair][position_side]
-
-        # Calculate new position
-        if position_action == PositionAction.OPEN:
-            # Opening or adding to position
-            if trade_type == TradeType.BUY:
-                # Long position
-                new_amount = position.amount + amount
-                new_entry_price = (
-                    ((position.entry_price * position.amount) + (price * amount)) / new_amount
-                    if new_amount > 0
-                    else price
-                )
-
-                position.amount = new_amount
-                position.entry_price = new_entry_price
-            else:
-                # Short position
-                new_amount = position.amount - amount  # Short is negative
-                new_entry_price = (
-                    ((position.entry_price * abs(position.amount)) + (price * amount)) / abs(new_amount)
-                    if new_amount < 0
-                    else price
-                )
-
-                position.amount = new_amount
-                position.entry_price = new_entry_price
-        else:
-            # Closing or reducing position
-            if trade_type == TradeType.BUY:
-                # Closing short position
-                position.amount += amount
-            else:
-                # Closing long position
-                position.amount -= amount
-
-            # If position is fully closed, reset entry price
-            if position.amount == 0:
-                position.entry_price = Decimal("0")
-
-        # Update unrealized PnL
-        mark_price = self._funding_info.get(trading_pair, {}).get("markPrice", price)
-        if position.amount > 0:  # Long position
-            position.unrealized_pnl = (mark_price - position.entry_price) * position.amount
-        elif position.amount < 0:  # Short position
-            position.unrealized_pnl = (position.entry_price - mark_price) * abs(position.amount)
-        else:  # No position
-            position.unrealized_pnl = Decimal("0")
-
-    async def _execute_cancel(self, trading_pair: str, order_id: str) -> str:
-        """
-        Execute order cancellation (simulated)
-        """
-        if order_id not in self._orders_cache:
-            raise ValueError(f"Order {order_id} not found in cache")
-
-        order = self._orders_cache[order_id]
-
-        # Only cancel if order is still active
-        if order["status"] in ["NEW", "PARTIALLY_FILLED"]:
-            order["status"] = "CANCELED"
-
-            # Create order update
-            order_update = OrderUpdate(
-                client_order_id=order_id,
-                exchange_order_id=order["exchange_order_id"],
-                trading_pair=trading_pair,
-                update_timestamp=time.time(),
-                new_state=OrderState.CANCELED,
-            )
-
-            # Process order update
-            self._order_tracker.process_order_update(order_update)
-
-        return order["exchange_order_id"]
-
-    async def _set_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
-        """
-        Set leverage for a trading pair (simulated)
-        """
-        self._leverage[trading_pair] = Decimal(str(leverage))
-
-        # Update positions with new leverage
-        if trading_pair in self._positions_cache:
-            for position in self._positions_cache[trading_pair].values():
-                position.leverage = Decimal(str(leverage))
-
-        return True, f"Leverage for {trading_pair} set to {leverage}x"
-
-    async def _set_position_mode(self, position_mode: PositionMode) -> Tuple[bool, str]:
-        """
-        Set position mode (simulated)
-        """
-        old_mode = self._position_mode
-        self._position_mode = position_mode
-
-        # If changing from one-way to hedge mode, convert positions
-        if old_mode == PositionMode.ONEWAY and position_mode == PositionMode.HEDGE:
-            for trading_pair, positions in self._positions_cache.items():
-                if PositionSide.BOTH in positions:
-                    both_position = positions[PositionSide.BOTH]
-
-                    # Convert to long or short based on amount
-                    if both_position.amount > 0:
-                        # Convert to long
-                        positions[PositionSide.LONG] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.LONG,
-                            unrealized_pnl=both_position.unrealized_pnl,
-                            entry_price=both_position.entry_price,
-                            amount=both_position.amount,
-                            leverage=both_position.leverage,
-                        )
-                        positions[PositionSide.SHORT] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.SHORT,
-                            unrealized_pnl=Decimal("0"),
-                            entry_price=Decimal("0"),
-                            amount=Decimal("0"),
-                            leverage=both_position.leverage,
-                        )
-                    elif both_position.amount < 0:
-                        # Convert to short
-                        positions[PositionSide.SHORT] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.SHORT,
-                            unrealized_pnl=both_position.unrealized_pnl,
-                            entry_price=both_position.entry_price,
-                            amount=both_position.amount,
-                            leverage=both_position.leverage,
-                        )
-                        positions[PositionSide.LONG] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.LONG,
-                            unrealized_pnl=Decimal("0"),
-                            entry_price=Decimal("0"),
-                            amount=Decimal("0"),
-                            leverage=both_position.leverage,
-                        )
-
-                    # Remove BOTH position
-                    del positions[PositionSide.BOTH]
-
-        # If changing from hedge to one-way mode, convert positions
-        elif old_mode == PositionMode.HEDGE and position_mode == PositionMode.ONEWAY:
-            for trading_pair, positions in self._positions_cache.items():
-                long_amount = Decimal("0")
-                short_amount = Decimal("0")
-                long_entry_price = Decimal("0")
-                short_entry_price = Decimal("0")
-                leverage = self._leverage[trading_pair]
-
-                if PositionSide.LONG in positions:
-                    long_amount = positions[PositionSide.LONG].amount
-                    long_entry_price = positions[PositionSide.LONG].entry_price
-                    leverage = positions[PositionSide.LONG].leverage
-
-                if PositionSide.SHORT in positions:
-                    short_amount = positions[PositionSide.SHORT].amount
-                    short_entry_price = positions[PositionSide.SHORT].entry_price
-                    leverage = positions[PositionSide.SHORT].leverage
-
-                # Net position
-                net_amount = long_amount + short_amount
-
-                # Calculate entry price for net position
-                if net_amount > 0:
-                    entry_price = long_entry_price
-                elif net_amount < 0:
-                    entry_price = short_entry_price
-                else:
-                    entry_price = Decimal("0")
-
-                # Create BOTH position
-                positions[PositionSide.BOTH] = Position(
-                    trading_pair=trading_pair,
-                    position_side=PositionSide.BOTH,
-                    unrealized_pnl=Decimal("0"),
-                    entry_price=entry_price,
-                    amount=net_amount,
-                    leverage=leverage,
-                )
-
-                # Remove LONG and SHORT positions
-                if PositionSide.LONG in positions:
-                    del positions[PositionSide.LONG]
-                if PositionSide.SHORT in positions:
-                    del positions[PositionSide.SHORT]
-
-        return True, f"Position mode set to {position_mode.name}"
-
-    async def _fetch_positions(self) -> List[Position]:
-        """
-        Fetch all positions (simulated)
-        """
-        positions = []
-
-        for trading_pair, position_dict in self._positions_cache.items():
-            for position in position_dict.values():
-                # Only include positions with non-zero amount
-                if position.amount != 0:
-                    positions.append(position)
-
-        return positions
-
-    async def _fetch_funding_payment(self, trading_pair: str) -> List[Dict[str, Any]]:
-        """
-        Fetch funding payments (simulated)
-        """
-        current_time = int(time.time() * 1000)
-
-        # Simulate a funding payment every 8 hours
-        funding_payments = []
-
-        # Get position for the trading pair
-        positions = self._positions_cache.get(trading_pair, {})
-
-        for position_side, position in positions.items():
-            if position.amount == 0:
+        # Update positions
+        for asset in update_data.get("P", []):
+            trading_pair = asset["s"]
+            try:
+                hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
+            except KeyError:
+                # Ignore results for which their symbols is not tracked by the connector
                 continue
 
-            # Simulate funding payment
-            funding_rate = self._funding_info.get(trading_pair, {}).get("fundingRate", Decimal("0.0001"))
-            payment_amount = position.amount * position.entry_price * funding_rate
-
-            funding_payments.append(
-                {
-                    "symbol": qtx_perpetual_utils.convert_to_exchange_trading_pair(trading_pair),
-                    "incomeType": "FUNDING_FEE",
-                    "income": str(payment_amount),
-                    "asset": trading_pair.split("-")[1],  # Quote currency
-                    "time": current_time - 8 * 3600 * 1000,  # 8 hours ago
-                    "info": "Simulated funding payment",
-                    "tranId": f"f-{current_time}",
-                    "tradeId": "",
-                }
-            )
-
-        return funding_payments
-
-    async def _create_order(
-        self,
-        trade_type: TradeType,
-        order_id: str,
-        trading_pair: str,
-        amount: Decimal,
-        order_type: OrderType,
-        price: Decimal,
-        position_action: PositionAction = PositionAction.OPEN,
-        **kwargs,
-    ) -> Tuple[str, float]:
-        """
-        Create a simulated order
-        """
-        exchange_order_id = f"s-{order_id}"  # Simulated exchange order ID
-
-        # Store order in cache
-        self._orders_cache[order_id] = {
-            "id": order_id,
-            "exchange_order_id": exchange_order_id,
-            "trading_pair": trading_pair,
-            "type": order_type,
-            "trade_type": trade_type,
-            "price": price,
-            "amount": amount,
-            "executed_amount": Decimal("0"),
-            "status": "NEW",
-            "created_time": time.time(),
-            "position_action": position_action,
-        }
-
-        # Simulate immediate fill for market orders
-        if order_type is OrderType.MARKET:
-            # Schedule order fill
-            self.schedule_async_call(
-                self._simulate_order_fill(order_id, amount, price), 0.1  # Small delay to simulate network latency
-            )
-
-        # Return simulated exchange order ID and timestamp
-        return exchange_order_id, time.time()
-
-    
-    def _get_position_side(self, trade_type: TradeType, position_action: PositionAction) -> PositionSide:
-        """
-        Determine position side based on trade type and position action
-        """
-        if self._position_mode == PositionMode.ONEWAY:
-            return PositionSide.BOTH
-
-        # Hedge mode
-        if position_action == PositionAction.OPEN:
-            if trade_type == TradeType.BUY:
-                return PositionSide.LONG
-            else:
-                return PositionSide.SHORT
-        else:  # CLOSE
-            if trade_type == TradeType.BUY:
-                return PositionSide.SHORT  # Buy to close short
-            else:
-                return PositionSide.LONG  # Sell to close long
-
-    async def _update_position_from_fill(
-        self,
-        trading_pair: str,
-        position_side: PositionSide,
-        amount: Decimal,
-        price: Decimal,
-        trade_type: TradeType,
-        position_action: PositionAction,
-    ):
-        """
-        Update position based on order fill
-        """
-        if trading_pair not in self._positions_cache or position_side not in self._positions_cache[trading_pair]:
-            # Initialize position if not exists
-            self._positions_cache[trading_pair][position_side] = Position(
-                trading_pair=trading_pair,
-                position_side=position_side,
-                unrealized_pnl=Decimal("0"),
-                entry_price=price,
-                amount=Decimal("0"),
-                leverage=self._leverage[trading_pair],
-            )
-
-        position = self._positions_cache[trading_pair][position_side]
-
-        # Calculate new position
-        if position_action == PositionAction.OPEN:
-            # Opening or adding to position
-            if trade_type == TradeType.BUY:
-                # Long position
-                new_amount = position.amount + amount
-                new_entry_price = (
-                    ((position.entry_price * position.amount) + (price * amount)) / new_amount
-                    if new_amount > 0
-                    else price
-                )
-
-                position.amount = new_amount
-                position.entry_price = new_entry_price
-            else:
-                # Short position
-                new_amount = position.amount - amount  # Short is negative
-                new_entry_price = (
-                    ((position.entry_price * abs(position.amount)) + (price * amount)) / abs(new_amount)
-                    if new_amount < 0
-                    else price
-                )
-
-                position.amount = new_amount
-                position.entry_price = new_entry_price
-        else:
-            # Closing or reducing position
-            if trade_type == TradeType.BUY:
-                # Closing short position
-                position.amount += amount
-            else:
-                # Closing long position
-                position.amount -= amount
-
-            # If position is fully closed, reset entry price
-            if position.amount == 0:
-                position.entry_price = Decimal("0")
-
-        # Update unrealized PnL
-        mark_price = self._funding_info.get(trading_pair, {}).get("markPrice", price)
-        if position.amount > 0:  # Long position
-            position.unrealized_pnl = (mark_price - position.entry_price) * position.amount
-        elif position.amount < 0:  # Short position
-            position.unrealized_pnl = (position.entry_price - mark_price) * abs(position.amount)
-        else:  # No position
-            position.unrealized_pnl = Decimal("0")
-
-    async def _execute_cancel(self, trading_pair: str, order_id: str) -> str:
-        """
-        Execute order cancellation (simulated)
-        """
-        if order_id not in self._orders_cache:
-            raise ValueError(f"Order {order_id} not found in cache")
-
-        order = self._orders_cache[order_id]
-
-        # Only cancel if order is still active
-        if order["status"] in ["NEW", "PARTIALLY_FILLED"]:
-            order["status"] = "CANCELED"
-
-            # Create order update
-            order_update = OrderUpdate(
-                client_order_id=order_id,
-                exchange_order_id=order["exchange_order_id"],
-                trading_pair=trading_pair,
-                update_timestamp=time.time(),
-                new_state=OrderState.CANCELED,
-            )
-
-            # Process order update
-            self._order_tracker.process_order_update(order_update)
-
-        return order["exchange_order_id"]
-
-    async def _set_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
-        """
-        Set leverage for a trading pair (simulated)
-        """
-        self._leverage[trading_pair] = Decimal(str(leverage))
-
-        # Update positions with new leverage
-        if trading_pair in self._positions_cache:
-            for position in self._positions_cache[trading_pair].values():
-                position.leverage = Decimal(str(leverage))
-
-        return True, f"Leverage for {trading_pair} set to {leverage}x"
-
-    async def _set_position_mode(self, position_mode: PositionMode) -> Tuple[bool, str]:
-        """
-        Set position mode (simulated)
-        """
-        old_mode = self._position_mode
-        self._position_mode = position_mode
-
-        # If changing from one-way to hedge mode, convert positions
-        if old_mode == PositionMode.ONEWAY and position_mode == PositionMode.HEDGE:
-            for trading_pair, positions in self._positions_cache.items():
-                if PositionSide.BOTH in positions:
-                    both_position = positions[PositionSide.BOTH]
-
-                    # Convert to long or short based on amount
-                    if both_position.amount > 0:
-                        # Convert to long
-                        positions[PositionSide.LONG] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.LONG,
-                            unrealized_pnl=both_position.unrealized_pnl,
-                            entry_price=both_position.entry_price,
-                            amount=both_position.amount,
-                            leverage=both_position.leverage,
-                        )
-                        positions[PositionSide.SHORT] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.SHORT,
-                            unrealized_pnl=Decimal("0"),
-                            entry_price=Decimal("0"),
-                            amount=Decimal("0"),
-                            leverage=both_position.leverage,
-                        )
-                    elif both_position.amount < 0:
-                        # Convert to short
-                        positions[PositionSide.SHORT] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.SHORT,
-                            unrealized_pnl=both_position.unrealized_pnl,
-                            entry_price=both_position.entry_price,
-                            amount=both_position.amount,
-                            leverage=both_position.leverage,
-                        )
-                        positions[PositionSide.LONG] = Position(
-                            trading_pair=trading_pair,
-                            position_side=PositionSide.LONG,
-                            unrealized_pnl=Decimal("0"),
-                            entry_price=Decimal("0"),
-                            amount=Decimal("0"),
-                            leverage=both_position.leverage,
-                        )
-
-                    # Remove BOTH position
-                    del positions[PositionSide.BOTH]
-
-        # If changing from hedge to one-way mode, convert positions
-        elif old_mode == PositionMode.HEDGE and position_mode == PositionMode.ONEWAY:
-            for trading_pair, positions in self._positions_cache.items():
-                long_amount = Decimal("0")
-                short_amount = Decimal("0")
-                long_entry_price = Decimal("0")
-                short_entry_price = Decimal("0")
-                leverage = self._leverage[trading_pair]
-
-                if PositionSide.LONG in positions:
-                    long_amount = positions[PositionSide.LONG].amount
-                    long_entry_price = positions[PositionSide.LONG].entry_price
-                    leverage = positions[PositionSide.LONG].leverage
-
-                if PositionSide.SHORT in positions:
-                    short_amount = positions[PositionSide.SHORT].amount
-                    short_entry_price = positions[PositionSide.SHORT].entry_price
-                    leverage = positions[PositionSide.SHORT].leverage
-
-                # Net position
-                net_amount = long_amount + short_amount
-
-                # Calculate entry price for net position
-                if net_amount > 0:
-                    entry_price = long_entry_price
-                elif net_amount < 0:
-                    entry_price = short_entry_price
+            side = PositionSide[asset['ps']]
+            position = self._perpetual_trading.get_position(hb_trading_pair, side)
+            if position is not None:
+                amount = Decimal(asset["pa"])
+                if amount == Decimal("0"):
+                    pos_key = self._perpetual_trading.position_key(hb_trading_pair, side)
+                    self._perpetual_trading.remove_position(pos_key)
                 else:
-                    entry_price = Decimal("0")
+                    position.update_position(position_side=PositionSide[asset["ps"]],
+                                             unrealized_pnl=Decimal(asset["up"]),
+                                             entry_price=Decimal(asset["ep"]),
+                                             amount=Decimal(asset["pa"]))
+            else:
+                await self._update_positions()
 
-                # Create BOTH position
-                positions[PositionSide.BOTH] = Position(
-                    trading_pair=trading_pair,
-                    position_side=PositionSide.BOTH,
-                    unrealized_pnl=Decimal("0"),
-                    entry_price=entry_price,
-                    amount=net_amount,
-                    leverage=leverage,
-                )
+    async def _process_user_stream_margin_call(self, event_message: Dict[str, Any]):
+        positions = event_message.get("p", [])
+        total_maint_margin_required = Decimal(0)
+        negative_pnls_msg = ""
 
-                # Remove LONG and SHORT positions
-                if PositionSide.LONG in positions:
-                    del positions[PositionSide.LONG]
-                if PositionSide.SHORT in positions:
-                    del positions[PositionSide.SHORT]
-
-        return True, f"Position mode set to {position_mode.name}"
-
-    async def _fetch_positions(self) -> List[Position]:
-        """
-        Fetch all positions (simulated)
-        """
-        positions = []
-
-        for trading_pair, position_dict in self._positions_cache.items():
-            for position in position_dict.values():
-                # Only include positions with non-zero amount
-                if position.amount != 0:
-                    positions.append(position)
-
-        return positions
-
-    async def _fetch_funding_payment(self, trading_pair: str) -> List[Dict[str, Any]]:
-        """
-        Fetch funding payments (simulated)
-        """
-        current_time = int(time.time() * 1000)
-
-        # Simulate a funding payment every 8 hours
-        funding_payments = []
-
-        # Get position for the trading pair
-        positions = self._positions_cache.get(trading_pair, {})
-
-        for position_side, position in positions.items():
-            if position.amount == 0:
+        for position in positions:
+            trading_pair = position["s"]
+            try:
+                hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
+            except KeyError:
                 continue
 
-            # Simulate funding payment
-            funding_rate = self._funding_info.get(trading_pair, {}).get("fundingRate", Decimal("0.0001"))
-            payment_amount = position.amount * position.entry_price * funding_rate
+            existing_position = self._perpetual_trading.get_position(hb_trading_pair, PositionSide[position['ps']])
+            if existing_position is not None:
+                existing_position.update_position(position_side=PositionSide[position["ps"]],
+                                                  unrealized_pnl=Decimal(position["up"]),
+                                                  amount=Decimal(position["pa"]))
 
-            funding_payments.append(
-                {
-                    "symbol": qtx_perpetual_utils.convert_to_exchange_trading_pair(trading_pair),
-                    "incomeType": "FUNDING_FEE",
-                    "income": str(payment_amount),
-                    "asset": trading_pair.split("-")[1],  # Quote currency
-                    "time": current_time - 8 * 3600 * 1000,  # 8 hours ago
-                    "info": "Simulated funding payment",
-                    "tranId": f"f-{current_time}",
-                    "tradeId": "",
-                }
-            )
+            total_maint_margin_required += Decimal(position.get("mm", "0"))
+            if float(position.get("up", 0)) < 1:
+                negative_pnls_msg += f"{hb_trading_pair}: {position.get('up')}, "
 
-        return funding_payments
+        self.logger().warning("Margin Call: Your position risk is too high, and you are at risk of "
+                              "liquidation. Close your positions or add additional margin to your wallet.")
+        self.logger().info(f"Margin Required: {total_maint_margin_required}. "
+                           f"Negative PnL assets: {negative_pnls_msg}.")
+
+    async def _process_user_stream_config_update(self, event_message: Dict[str, Any]):
+        if "ac" in event_message:
+            ac_data = event_message["ac"]
+            if "s" in ac_data and "l" in ac_data:
+                trading_pair = ac_data["s"]
+                leverage = int(ac_data["l"])
+                try:
+                    hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
+                    self.logger().info(f"Leverage updated for {hb_trading_pair}: {leverage}x")
+                except KeyError:
+                    pass
+
+        if "ai" in event_message:
+            ai_data = event_message["ai"]
+            if "j" in ai_data:
+                is_multi_assets_mode = ai_data["j"]
+                self.logger().info(f"Multi-assets mode updated: {is_multi_assets_mode}")
+
+    async def _iter_user_event_queue(self) -> AsyncIterable[Dict[str, any]]:
+        while True:
+            try:
+                yield await self._user_stream_tracker.user_stream.get()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().network(
+                    "Unknown error. Retrying after 1 seconds.",
+                    exc_info=True,
+                    app_warning_msg="Could not fetch user events from Binance. Check API key and network connection.",
+                )
+                await self._sleep(1.0)
 
     async def start_network(self):
         """
-        Start the network and initialize data sources
+        Start networking (orderbook, user stream)
+        Initializes the warm-up phase for orderbook building
         """
+        # Reset the warm-up timer
+        self._ready = False
+        self._warm_up_start_time = time.time()
+
+        # Log the start of warm-up period
+        self.logger().info(f"Starting QTX Perpetual connector warm-up period ({CONSTANTS.ORDERBOOK_WARMUP_TIME} seconds)...")
+
+        # Start networks from parent class
         await super().start_network()
 
-        # Start the status polling loop
-        self._status_polling_task = asyncio.create_task(self._status_polling_loop())
-        
-        # Start the order simulation loop as a separate task
-        self._order_fill_task = asyncio.create_task(self._simulate_order_fills())
-
-        # Initialize with simulated data
-        await self._update_trading_rules()
-        await self._update_balances()
-        await self._update_positions()
-        await self._update_funding_info()
+        # If trading is required, update the Binance connector
+        if self._trading_required and self._binance_connector is not None:
+            await self._binance_connector._update_balances()
+            await self._binance_connector._update_positions()
+            await self._binance_connector._update_trading_rules()
 
     async def stop_network(self):
         """
-        Stop the network and clean up resources
+        Stop networking
         """
-        # Cancel status polling task
-        if self._status_polling_task is not None:
-            self._status_polling_task.cancel()
-            self._status_polling_task = None
-            
-        # Cancel order fill simulation task
-        if hasattr(self, "_order_fill_task") and self._order_fill_task is not None:
-            self._order_fill_task.cancel()
-            self._order_fill_task = None
+        # Reset the ready flag
+        self._ready = False
+        self._warm_up_start_time = 0
 
+        # Stop the network from parent class
         await super().stop_network()
 
-    def schedule_async_call(self, coro, delay):
-        """
-        Schedule an async coroutine to be executed after a delay
-        """
-
-        async def _delayed_call():
-            await asyncio.sleep(delay)
-            await coro
-
-        return asyncio.create_task(_delayed_call())
-
     async def get_last_traded_price(self, trading_pair: str) -> float:
-        """
-        Get the last traded price from the order book
-        """
-        order_book = self.get_order_book(trading_pair)
-        if order_book is not None and order_book.last_trade_price is not None:
-            return float(order_book.last_trade_price)
-        return 0.0
+        # Try to get price from QTX market data first
+        orderbook = self.get_order_book(trading_pair)
+        if orderbook and orderbook.last_trade_price:
+            return float(orderbook.last_trade_price)
 
-    async def get_position_mode(self) -> PositionMode:
+        # Last resort fallback - midpoint of best bid/ask
+        return (orderbook.get_price(True) + orderbook.get_price(False)) / 2
+
+    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         """
-        Get the current position mode
+        Create web assistants factory - delegate to Binance connector when available
         """
-        return self._position_mode
+        if self._trading_required and hasattr(self._binance_connector, "_create_web_assistants_factory"):
+            return self._binance_connector._create_web_assistants_factory()
+
+        # Fallback implementation
+        return WebAssistantsFactory(throttler=self._throttler, auth=self._auth)
+
+    def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> Dict[str, TradingRule]:
+        """
+        Format trading rules - delegate to Binance connector when available
+        """
+        if self._trading_required and hasattr(self._binance_connector, "_format_trading_rules"):
+            return self._binance_connector._format_trading_rules(exchange_info_dict)
+        return {}
+
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+        """
+        Initialize trading pair symbols - delegate to Binance connector when available
+        """
+        if self._trading_required and hasattr(self._binance_connector, "_initialize_trading_pair_symbols_from_exchange_info"):
+            return self._binance_connector._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
+
+        # Implement basic fallback version
+        try:
+            # Initialize maps if they don't exist
+            if not hasattr(self, "_exchange_symbol_map"):
+                self._exchange_symbol_map = {}
+            if not hasattr(self, "_symbol_to_exchange_symbol"):
+                self._symbol_to_exchange_symbol = {}
+            if not hasattr(self, "_exchange_info"):
+                self._exchange_info = {}
+
+            symbols_data = exchange_info.get("symbols", [])
+            for symbol_data in symbols_data:
+                symbol = symbol_data.get("symbol")
+                if symbol and symbol_data.get("status") == "TRADING":
+                    exchange_symbol = symbol
+                    self._exchange_symbol_map[exchange_symbol] = exchange_symbol
+                    self._symbol_to_exchange_symbol[exchange_symbol] = exchange_symbol
+                    # Store exchange info
+                    self._exchange_info[exchange_symbol] = symbol_data
+        except Exception as e:
+            self.logger().error(f"Error initializing trading pairs from exchange info: {e}", exc_info=True)
+
+    def _is_order_not_found_during_cancelation_error(self, exception) -> bool:
+        """
+        Check if the exception is due to order not found during cancelation
+        Delegate to Binance connector when available
+        """
+        if self._trading_required and hasattr(self._binance_connector, "_is_order_not_found_during_cancelation_error"):
+            return self._binance_connector._is_order_not_found_during_cancelation_error(exception)
+
+        # Fallback implementation
+        error_message = str(exception).lower()
+        return "order not found" in error_message or "unknown order" in error_message
+
+    def _is_order_not_found_during_status_update_error(self, exception) -> bool:
+        """
+        Check if the exception is due to order not found during status update
+        Delegate to Binance connector when available
+        """
+        if self._trading_required and hasattr(self._binance_connector, "_is_order_not_found_during_status_update_error"):
+            return self._binance_connector._is_order_not_found_during_status_update_error(exception)
+
+        # Fallback implementation
+        error_message = str(exception).lower()
+        return "order not found" in error_message or "unknown order" in error_message
+
+    def _is_request_exception_related_to_time_synchronizer(self, request_exception) -> bool:
+        """
+        Check if the exception is related to time synchronization
+        Delegate to Binance connector when available
+        """
+        if self._trading_required and hasattr(self._binance_connector, "_is_request_exception_related_to_time_synchronizer"):
+            return self._binance_connector._is_request_exception_related_to_time_synchronizer(request_exception)
+
+        # Fallback implementation
+        error_message = str(request_exception).lower()
+        return "timestamp" in error_message and "ahead" in error_message
+
+    async def _update_trading_fees(self):
+        """
+        Update trading fees - delegate to Binance connector when available
+        """
+        if self._trading_required and hasattr(self._binance_connector, "_update_trading_fees"):
+            await self._binance_connector._update_trading_fees()
+            if hasattr(self._binance_connector, "_trading_fees"):
+                self._trading_fees = self._binance_connector._trading_fees
+        # No-op implementation if not trading

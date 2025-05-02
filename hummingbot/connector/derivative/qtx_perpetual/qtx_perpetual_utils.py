@@ -1,16 +1,14 @@
 #!/usr/bin/env python
 
-import re
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-from pydantic import ConfigDict, Field, SecretStr
+from pydantic import Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
-from hummingbot.client.config.config_methods import using_exchange
+from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants as BINANCE_CONSTANTS
 from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_constants as CONSTANTS
 from hummingbot.core.data_type.common import OrderType, PositionMode, PositionSide, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 from hummingbot.core.utils.tracking_nonce import get_tracking_nonce
 
@@ -45,19 +43,19 @@ class QtxPerpetualConfigMap(BaseConnectorConfigMap):
             "is_connect_key": True,
         },
     )
-    qtx_perpetual_api_key: SecretStr = Field(
-        default="fake_api_key",
+    binance_api_key: SecretStr = Field(
+        default="",
         json_schema_extra={
-            "prompt": "Enter your QTX Perpetual API key",
+            "prompt": "Enter your Binance API key",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,
         },
     )
-    qtx_perpetual_api_secret: SecretStr = Field(
-        default="fake_secret_key",
+    binance_api_secret: SecretStr = Field(
+        default="",
         json_schema_extra={
-            "prompt": "Enter your QTX Perpetual API secret",
+            "prompt": "Enter your Binance API secret",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,
@@ -131,24 +129,6 @@ def convert_from_exchange_trading_pair(exchange_trading_pair: str) -> str:
     return exchange_trading_pair.upper()
 
 
-def convert_to_exchange_trading_pair(hb_trading_pair: str) -> str:
-    """
-    Convert from Hummingbot trading pair format to exchange format.
-    Example: BTC-USDT -> BTCUSDT
-    """
-    return format_trading_pair(hb_trading_pair)
-
-
-def build_api_factory_without_time_synchronizer_pre_processor(throttler):
-    """
-    Builds an API factory without time synchronizer pre-processor.
-    This is used for endpoints that don't require time synchronization.
-    """
-    from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_web_utils as web_utils
-
-    return web_utils.build_api_factory(throttler=throttler)
-
-
 def get_exchange_order_type(order_type: OrderType) -> str:
     """
     Convert OrderType to exchange order type string.
@@ -166,11 +146,11 @@ def get_exchange_time_in_force(order_type: OrderType) -> str:
     Convert OrderType to exchange time in force.
     """
     if order_type is OrderType.LIMIT:
-        return CONSTANTS.TIME_IN_FORCE_GTC
+        return BINANCE_CONSTANTS.TIME_IN_FORCE_GTC
     elif order_type is OrderType.MARKET:
-        return CONSTANTS.TIME_IN_FORCE_GTC
+        return BINANCE_CONSTANTS.TIME_IN_FORCE_GTC
     elif order_type is OrderType.LIMIT_MAKER:
-        return CONSTANTS.TIME_IN_FORCE_GTX
+        return BINANCE_CONSTANTS.TIME_IN_FORCE_GTX
     else:
         raise ValueError(f"Unsupported order type: {order_type}")
 
@@ -179,9 +159,9 @@ def get_position_mode_from_exchange_value(position_mode: str) -> PositionMode:
     """
     Convert exchange position mode string to PositionMode enum.
     """
-    if position_mode == CONSTANTS.ONE_WAY_MODE:
+    if position_mode == "ONE_WAY":
         return PositionMode.ONEWAY
-    elif position_mode == CONSTANTS.HEDGE_MODE:
+    elif position_mode == "HEDGE":
         return PositionMode.HEDGE
     else:
         raise ValueError(f"Unsupported position mode: {position_mode}")
@@ -192,9 +172,9 @@ def get_position_mode_exchange_value(position_mode: PositionMode) -> str:
     Convert PositionMode enum to exchange position mode string.
     """
     if position_mode is PositionMode.ONEWAY:
-        return CONSTANTS.ONE_WAY_MODE
+        return "ONE_WAY"
     elif position_mode is PositionMode.HEDGE:
-        return CONSTANTS.HEDGE_MODE
+        return "HEDGE"
 
 
 def get_position_side_from_exchange_value(position_side: str) -> PositionSide:
@@ -227,7 +207,77 @@ def get_order_status_from_exchange_value(status: str) -> str:
     """
     Convert exchange order status string to internal order status string.
     """
-    if status in CONSTANTS.ORDER_STATE:
-        return CONSTANTS.ORDER_STATE[status]
-    else:
-        raise ValueError(f"Order status {status} is not supported.")
+    return CONSTANTS.ORDER_STATE.get(status, "UNKNOWN")
+
+
+# Binance-specific utility functions
+
+def convert_to_binance_trading_pair(trading_pair: str) -> str:
+    """
+    Converts Hummingbot trading pair format to Binance format
+    Example: BTC-USDT -> BTCUSDT
+    """
+    return trading_pair.replace("-", "")
+
+
+def convert_from_binance_trading_pair(binance_symbol: str, trading_pairs: List[str]) -> str:
+    """
+    Converts Binance symbol to Hummingbot trading pair format
+    Example: BTCUSDT -> BTC-USDT
+
+    :param binance_symbol: The Binance symbol to convert
+    :param trading_pairs: List of available trading pairs to match against
+    :return: The converted trading pair in Hummingbot format
+    """
+    # First try direct conversion by checking if removing the dash matches
+    for tp in trading_pairs:
+        if binance_symbol == tp.replace("-", ""):
+            return tp
+
+    # If no direct match, try to identify base and quote
+    # Common quote currencies in perpetual futures
+    quote_currencies = ["USDT", "BUSD", "USDC", "USD", "BTC", "ETH"]
+
+    for quote in quote_currencies:
+        if binance_symbol.endswith(quote):
+            base = binance_symbol[:-len(quote)]
+            candidate = f"{base}-{quote}"
+            if candidate in trading_pairs:
+                return candidate
+
+    # If we still can't find a match, try a more sophisticated approach
+    # by checking all possible splits of the symbol
+    for i in range(1, len(binance_symbol)):
+        base = binance_symbol[:i]
+        quote = binance_symbol[i:]
+        candidate = f"{base}-{quote}"
+        if candidate in trading_pairs:
+            return candidate
+
+    # If all else fails, return a best guess
+    for quote in quote_currencies:
+        if binance_symbol.endswith(quote):
+            base = binance_symbol[:-len(quote)]
+            return f"{base}-{quote}"
+
+    # Last resort: just insert a dash before the last 4 characters
+    return f"{binance_symbol[:-4]}-{binance_symbol[-4:]}"
+
+
+def map_binance_order_status(binance_status: str) -> str:
+    """
+    Maps Binance order status to internal order status
+    """
+    # Binance uses the same status strings as our internal constants
+    return binance_status
+
+
+def get_binance_position_mode(position_mode: PositionMode) -> bool:
+    """
+    Converts PositionMode enum to Binance position mode value
+    For Binance, dualSidePosition=true means HEDGE mode, false means ONE-WAY
+
+    :param position_mode: The position mode to convert
+    :return: Boolean value for Binance API
+    """
+    return position_mode == PositionMode.HEDGE
