@@ -1,76 +1,222 @@
 #!/usr/bin/env python
 
 import asyncio
-import socket
-import struct
 import time
-from collections import defaultdict
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants as BINANCE_CONSTANTS
 from hummingbot.connector.derivative.qtx_perpetual import (
     qtx_perpetual_constants as CONSTANTS,
-    qtx_perpetual_web_utils as web_utils,
+    qtx_perpetual_udp_manager as udp_manager,
 )
-from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo, FundingInfoUpdate
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+
+# ---------------------------------------- Order Book Data Source Class ----------------------------------------
 
 
 class QtxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     """
-    OrderBookTrackerDataSource implementation for QTX Perpetual using UDP for market data.
-    This class connects to QTX's UDP feed for real-time order book data, while
-    using Binance API for funding rate information.
+    QTX Perpetual API order book data source that connects to QTX's UDP market data feed.
+
+    This class is responsible for:
+    1. Setting up and managing the UDP connection via the centralized UDP manager
+    2. Converting market data into Hummingbot's standard OrderBookMessage format
+    3. Providing funding info (delegated to Binance) for consistent futures trading
+
+    This implementation removes direct UDP socket handling, delegating to QtxPerpetualUDPManager.
     """
-    _logger: Optional[HummingbotLogger] = None
+
+    MESSAGE_TIMEOUT = 30.0
+    SNAPSHOT_TIMEOUT = 10.0
+
+    _qtxpos_api_source_logger: Optional[HummingbotLogger] = None
 
     def __init__(
         self,
         trading_pairs: List[str],
         connector,
-        api_factory: WebAssistantsFactory,
-        domain: str = CONSTANTS.DEFAULT_DOMAIN,
-        host: str = CONSTANTS.DEFAULT_UDP_HOST,
-        port: int = CONSTANTS.DEFAULT_UDP_PORT,
+        api_factory: Optional[WebAssistantsFactory] = None,
+        domain: str = CONSTANTS.DEFAULT_DOMAIN,  # Accept domain for compatibility but don't use it
+        host: str = None,  # Accept host for compatibility
+        port: int = None,  # Accept port for compatibility
+        udp_manager_instance: Optional[udp_manager.QtxPerpetualUDPManager] = None,  # Accept existing UDP manager
     ):
         super().__init__(trading_pairs)
         self._connector = connector
-        self._api_factory = api_factory
-        self._domain = domain
-        self._host = host
-        self._port = port
-        self._throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
-        self._udp_socket = None
-        self._subscribed_pairs = set()
-        self._listening_task = None
-        self._funding_info_listener_task = None
-        self._funding_info: Dict[str, Dict] = {}
-        self._funding_info_callbacks = []
+        # Store api_factory for Binance funding info calls only
+        self._web_assistants_factory = api_factory
 
-        # Message queues for different types of data
-        self._message_queue = defaultdict(asyncio.Queue)
-        self._trade_messages_queue_key = "trade"
-        self._diff_messages_queue_key = "diff"
-        self._snapshot_messages_queue_key = "snapshot"
-        self._funding_info_messages_queue_key = "funding_info"
+        # Initialize message queues for the different types of messages
+        self._message_queue = {
+            self._snapshot_messages_queue_key: asyncio.Queue(),
+            self._diff_messages_queue_key: asyncio.Queue(),
+            self._trade_messages_queue_key: asyncio.Queue(),
+            self._funding_info_messages_queue_key: asyncio.Queue(),
+        }
 
-        # Subscription index tracking for UDP feed
-        self._subscription_indices = {}
-        self._last_update_id = {}
+        # UDP connection settings - get from connector or use provided values
+        self._host = host if host is not None else connector._qtx_perpetual_host
+        self._port = port if port is not None else connector._qtx_perpetual_port
+
+        # Use provided UDP manager or create a new one if not provided
+        if udp_manager_instance is not None:
+            self.logger().info("Using provided UDP manager instance")
+            self._udp_manager = udp_manager_instance
+        elif hasattr(connector, "udp_manager") and connector.udp_manager is not None:
+            self.logger().info("Using connector's UDP manager instance via property getter")
+            self._udp_manager = connector.udp_manager
+        else:
+            # Create a new UDP manager instance
+            self.logger().info("Creating new UDP manager instance (fallback)")
+            self._udp_manager = udp_manager.QtxPerpetualUDPManager(host=self._host, port=self._port)
+
+        # Register callbacks for different message types
+        self._register_callbacks()
+
+        # Data tracking
         self._empty_orderbook = {}
+        self._funding_info_listener_task = None
+
+        # Cache for exchange symbols to trading pairs mapping
+        self._exchange_trading_pairs = {}
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
-        if cls._logger is None:
-            cls._logger = HummingbotLogger(__name__)
-        return cls._logger
+        if cls._qtxpos_api_source_logger is None:
+            cls._qtxpos_api_source_logger = HummingbotLogger(__name__)
+        return cls._qtxpos_api_source_logger
+
+    def _register_callbacks(self):
+        """Register callback functions for UDP manager message types"""
+        # Ticker callbacks (bid = 1, ask = -1)
+        self._udp_manager.register_message_callback(1, self._handle_ticker_message)
+        self._udp_manager.register_message_callback(-1, self._handle_ticker_message)
+
+        # Depth (orderbook) callback
+        self._udp_manager.register_message_callback(2, self._handle_depth_message)
+
+        # Trade callbacks (buy = 3, sell = -3)
+        self._udp_manager.register_message_callback(3, self._handle_trade_message)
+        self._udp_manager.register_message_callback(-3, self._handle_trade_message)
+
+    # ---------------------------------------- Lifecycle Management ----------------------------------------
+
+    async def start(self):
+        """
+        Starts the data source by:
+        1. Setting up the UDP socket for market data
+        2. Starting the funding info listener for Binance data
+        """
+        # Log start()
+        self.logger().info("Calling start() in the api order book data source")
+
+        # Start UDP socket listener - this sets up UDP connection and subscribes to trading pairs
+        await self.listen_for_subscriptions()
+
+        # Mark all orderbooks as empty initially
+        # They will be populated by real market data from the UDP feed
+        for trading_pair in self._trading_pairs:
+            self._empty_orderbook[trading_pair] = True
+
+        # Register callbacks for message handling
+        self._register_callbacks()
+
+        # Start funding info listener
+        if self._funding_info_listener_task is None:
+            self._funding_info_listener_task = asyncio.create_task(self._listen_for_funding_info())
+            self.logger().info("Funding info listener started")
+
+    async def stop(self):
+        """
+        Stops the data source and unsubscribes from all symbols
+        """
+        # Stop the UDP manager if we created it ourselves
+        if self._udp_manager is not None:
+            if not hasattr(self._connector, "_udp_manager") or self._connector._udp_manager is not self._udp_manager:
+                self.logger().info("Stopping our own UDP manager instance")
+                await self._udp_manager.stop_listening()
+            else:
+                self.logger().info("Skipping stop of connector's UDP manager instance")
+
+        # Stop funding info listener
+        if hasattr(self, "_funding_info_listener_task") and self._funding_info_listener_task is not None:
+            self._funding_info_listener_task.cancel()
+            try:
+                await self._funding_info_listener_task
+            except asyncio.CancelledError:
+                self.logger().info("Funding info listener task cancelled during stop")
+            self._funding_info_listener_task = None
+
+        self.logger().info("QtxPerpetualAPIOrderBookDataSource stopped")
+
+    # ---------------------------------------- End of Lifecycle Management ----------------------------------------
+
+    # ---------------------------------------- Subscription Management ----------------------------------------
+
+    async def listen_for_subscriptions(self):
+        """
+        Custom implementation using UDP for order book data instead of WebSockets.
+        Uses the UDP manager to connect to QTX UDP feed, subscribe to trading pairs,
+        and start the message listening process.
+        """
+        # UDP connection is centralized in the UDP manager
+        self.logger().info(f"Setting up UDP connection to {self._host}:{self._port}")
+
+        # First, determine if we need to stop an existing connection
+        if hasattr(self, "_udp_manager") and self._udp_manager is not None:
+            if self._udp_manager._is_connected:
+                # We already have an active connection - check if we need to unsubscribe
+                if self._udp_manager._subscribed_pairs:
+                    self.logger().info("Connection already exists - unsubscribing from existing pairs")
+                    await self._udp_manager.unsubscribe_from_all()
+
+                # Always ensure the listening task is stopped before reconnecting
+                if self._udp_manager._listening_task is not None and not self._udp_manager._listening_task.done():
+                    self.logger().info("Stopping existing listener task")
+                    await self._udp_manager.stop_listening()
+
+        # Connect to UDP server - UDP manager handles retries internally
+        try:
+            success = await self._udp_manager.connect()
+            if not success:
+                self.logger().error("Failed to connect to UDP server")
+                return
+
+            self.logger().info("Successfully connected to UDP server")
+        except Exception as e:
+            self.logger().error(f"Error connecting to UDP server: {e}", exc_info=True)
+            return
+
+        # Mark all orderbooks as empty - will be populated by market data
+        for trading_pair in self._trading_pairs:
+            self._empty_orderbook[trading_pair] = True
+
+        # Subscribe to trading pairs - UDP manager handles the conversion to exchange format
+        success, subscribed_pairs = await self._udp_manager.subscribe_to_trading_pairs(self._trading_pairs)
+        if not success:
+            self.logger().error("Failed to subscribe to trading pairs")
+            return
+
+        self.logger().info(f"Successfully subscribed to {len(subscribed_pairs)} trading pairs")
+
+        # Start listening for messages
+        await self._udp_manager.start_listening()
+
+        # Log confirmation of setup
+        self.logger().info("UDP feed connection and subscriptions successfully established")
+
+    # ---------------------------------------- End of Subscription Management ----------------------------------------
+
+    # ---------------------------------------- Market Data Access ----------------------------------------
 
     async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
         """
@@ -84,455 +230,237 @@ class QtxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             result[trading_pair] = await self._connector.get_last_traded_price(trading_pair)
         return result
 
-    async def get_funding_info(self, trading_pair: str) -> FundingInfo:
+    # ---------------------------------------- End of Market Data Access ----------------------------------------
+
+    # ---------------------------------------- Message Handling ----------------------------------------
+
+    async def _handle_ticker_message(self, message: Dict[str, Any]):
         """
-        Get funding information for a trading pair
+        Handle ticker messages from UDP manager and convert to order book diff message
 
-        :param trading_pair: Trading pair to get funding info for
-        :return: FundingInfo object
+        :param message: Parsed ticker message
         """
-        # Check if we have cached info that's still fresh
-        if trading_pair in self._funding_info:
-            cached_info = self._funding_info[trading_pair]
-            # If info is less than 60 seconds old, use it
-            if time.time() - cached_info["timestamp"] < 60:
-                return FundingInfo(
-                    trading_pair=trading_pair,
-                    index_price=cached_info["indexPrice"],
-                    mark_price=cached_info["markPrice"],
-                    next_funding_utc_timestamp=int(float(cached_info["nextFundingTime"]) * 1e-3),
-                    rate=cached_info["fundingRate"],
-                )
-
-        # If no cached info or data is stale, get from Binance
-        if self._connector._trading_required and hasattr(self._connector, "_binance_connector"):
-            try:
-                # Get exchange symbol format
-                exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
-
-                # Request funding info from Binance
-                data = await self._connector._binance_connector._api_request(
-                    method="GET",
-                    path_url=BINANCE_CONSTANTS.MARK_PRICE_URL,
-                    params={"symbol": exchange_symbol},
-                    is_auth_required=False
-                )
-
-                # Store the funding info in cache
-                self._funding_info[trading_pair] = {
-                    "timestamp": time.time(),
-                    "indexPrice": Decimal(str(data.get("indexPrice", "0"))),
-                    "markPrice": Decimal(str(data.get("markPrice", "0"))),
-                    "nextFundingTime": int(data.get("nextFundingTime", 0)),
-                    "fundingRate": Decimal(str(data.get("lastFundingRate", "0"))),
-                }
-
-                # Create funding info object
-                funding_info = FundingInfo(
-                    trading_pair=trading_pair,
-                    index_price=Decimal(str(data.get("indexPrice", "0"))),
-                    mark_price=Decimal(str(data.get("markPrice", "0"))),
-                    next_funding_utc_timestamp=int(float(data.get("nextFundingTime", 0)) * 1e-3),
-                    rate=Decimal(str(data.get("lastFundingRate", "0"))),
-                )
-
-                # Notify any registered callbacks
-                for callback in self._funding_info_callbacks:
-                    await callback(trading_pair, funding_info)
-
-                return funding_info
-            except Exception as e:
-                self.logger().error(f"Error getting funding info from Binance: {e}", exc_info=True)
-
-        # Default values if we couldn't get data
-        return FundingInfo(
-            trading_pair=trading_pair,
-            index_price=Decimal("0"),
-            mark_price=Decimal("0"),
-            next_funding_utc_timestamp=0,
-            rate=Decimal("0"),
-        )
-
-    async def register_funding_info_callback(self, callback):
-        """
-        Register a callback for funding info updates
-        """
-        self._funding_info_callbacks.append(callback)
-
-    async def _subscribe_to_order_book_streams(self) -> None:
-        """
-        Subscribe to order book streams for all trading pairs using UDP
-        """
-        try:
-            # Initialize UDP socket
-            self._udp_socket = web_utils.get_udp_socket(self._host, self._port)
-
-            # Set socket to blocking mode for subscription phase
-            self._udp_socket.setblocking(True)
-            self._udp_socket.settimeout(2.0)  # Timeout for subscription responses
-
-            # Subscribe to each trading pair
-            self._subscription_indices = {}
-            subscription_success = False
-
-            for trading_pair in self._trading_pairs:
-                try:
-                    # Convert trading pair to QTX format (e.g., BTC-USDT-PERP -> binance-futures:btcusdt)
-                    exchange_symbol = self._get_exchange_symbol_from_trading_pair(trading_pair)
-                    self.logger().info(f"Subscribing to QTX UDP feed: {exchange_symbol} for {trading_pair}")
-
-                    # Send subscription request
-                    self._udp_socket.sendto(exchange_symbol.encode(), (self._host, self._port))
-
-                    # Wait for ACK (index number)
-                    deadline = time.time() + 2.0
-                    index = None
-
-                    while time.time() < deadline:
-                        try:
-                            response, addr = self._udp_socket.recvfrom(CONSTANTS.DEFAULT_UDP_BUFFER_SIZE)
-                        except socket.timeout:
-                            self.logger().error(f"Timeout waiting for ACK for {exchange_symbol}")
-                            break
-
-                        # Ignore packets not from the server
-                        if addr[0] != self._host:
-                            continue
-
-                        try:
-                            # ACK should be an integer index
-                            idx = int(response.decode().strip())
-                            index = idx
-                            self.logger().info(f"Got ACK {idx} for {exchange_symbol}")
-                            break
-                        except (UnicodeDecodeError, ValueError):
-                            # Not an index, likely market data - ignore
-                            continue
-
-                    if index is None:
-                        self.logger().error(f"No valid ACK for {exchange_symbol}")
-                        continue
-
-                    # Store subscription index
-                    self._subscription_indices[index] = trading_pair
-                    self._subscribed_pairs.add(trading_pair)
-                    subscription_success = True
-
-                    # Initialize empty state for this pair
-                    self._empty_orderbook[trading_pair] = True
-                    self._last_update_id[trading_pair] = int(time.time() * 1000)
-
-                    self.logger().info(f"Successfully subscribed to {exchange_symbol} with index {index}")
-
-                except Exception as e:
-                    self.logger().error(f"Error subscribing to {trading_pair}: {e}", exc_info=True)
-
-                # Small delay between subscriptions
-                await asyncio.sleep(0.1)
-
-            # Set socket back to non-blocking for receiving data
-            self._udp_socket.setblocking(False)
-
-            if not subscription_success:
-                self.logger().error("No successful subscriptions to QTX UDP feed, market data may not be available")
-
-            # Start listening task for incoming data
-            if self._listening_task is None:
-                self._listening_task = asyncio.create_task(self._listen_for_trades_and_orderbooks())
-
-        except Exception as e:
-            self.logger().error(f"Error subscribing to QTX UDP feed: {e}", exc_info=True)
-            raise
-
-    def _get_exchange_symbol_from_trading_pair(self, trading_pair: str) -> str:
-        """
-        Convert Hummingbot trading pair format to QTX format
-        Format: "BTC-USD" -> "binance-futures:btcusdt"
-        """
-        # Check if this is a perpetual contract
-        if (trading_pair.endswith("-PERP")):
-            pair = trading_pair[:-5].replace("-", "").lower()
-        else:
-            pair = trading_pair.replace("-", "").lower()
-
-        # Format the symbol
-        return f"binance-futures:{pair}"
-
-    def _parse_binary_message(self, data: bytes) -> Optional[Dict]:
-        """
-        Parse binary message from UDP feed based on the format in qtx_udp_logger.py
-        UDP message format: <msg_type:int><index:int><tx_ms:long><event_ms:long><local_ns:long><sn_id:long>
-        followed by message-specific data
-        """
-        if not data or len(data) < 40:  # Minimum header size
-            return None
-
-        try:
-            # Parse the message header (40 bytes)
-            msg_type, index, tx_ms, event_ms, local_ns, sn_id = struct.unpack("<iiqqqq", data[:40])
-
-            # Get the trading pair from the subscription index
-            trading_pair = self._subscription_indices.get(index)
-            if not trading_pair:
-                self.logger().debug(f"Received message for unknown subscription index: {index}")
-                return None
-
-            # Process based on message type
-            timestamp = time.time()
-
-            if abs(msg_type) == 1:  # Ticker (Bid = 1, Ask = -1)
-                # Extract price and size
-                if len(data) < 56:
-                    return None
-
-                price, size = struct.unpack("<dd", data[40:56])
-                side = "bid" if msg_type > 0 else "ask"
-
-                # Create ticker message
-                update_id = int(timestamp * 1000)
-                if trading_pair in self._last_update_id:
-                    update_id = max(update_id, self._last_update_id[trading_pair] + 1)
-                self._last_update_id[trading_pair] = update_id
-
-                # Log for debugging
-                self.logger().debug(f"Ticker: {side}, {trading_pair}, price: {price}, size: {size}")
-
-                return {
-                    "type": CONSTANTS.DIFF_MESSAGE_TYPE,  # Map ticker to diff for Hummingbot
-                    "trading_pair": trading_pair,
-                    "timestamp": timestamp,
-                    "update_id": update_id,
-                    "bids": [[price, size]] if side == "bid" else [],
-                    "asks": [] if side == "bid" else [[price, size]]
-                }
-
-            elif msg_type == 2:  # Depth (Order Book)
-                # Get ask and bid counts
-                if len(data) < 56:  # 40 bytes header + 16 bytes counts
-                    return None
-
-                asks_len, bids_len = struct.unpack("<qq", data[40:56])
-
-                # Extract asks and bids
-                asks = []
-                bids = []
-                offset = 56  # Start after the header and counts
-
-                # Parse asks
-                for i in range(asks_len):
-                    if offset + 16 <= len(data):
-                        price, size = struct.unpack("<dd", data[offset:offset + 16])
-                        asks.append([price, size])
-                        offset += 16  # Each price/size pair is 16 bytes
-
-                # Parse bids
-                for i in range(bids_len):
-                    if offset + 16 <= len(data):
-                        price, size = struct.unpack("<dd", data[offset:offset + 16])
-                        bids.append([price, size])
-                        offset += 16  # Each price/size pair is 16 bytes
-
-                # Sort bids (desc) and asks (asc)
-                bids.sort(key=lambda x: float(x[0]), reverse=True)
-                asks.sort(key=lambda x: float(x[0]))
-
-                update_id = int(timestamp * 1000)
-                if trading_pair in self._last_update_id:
-                    update_id = max(update_id, self._last_update_id[trading_pair] + 1)
-                self._last_update_id[trading_pair] = update_id
-
-                # Log for debugging
-                self.logger().debug(f"Depth: {trading_pair}, asks: {len(asks)}, bids: {len(bids)}")
-
-                # Mark that we've received data for this trading pair
-                if trading_pair in self._empty_orderbook:
-                    self._empty_orderbook[trading_pair] = False
-
-                return {
-                    "type": CONSTANTS.DIFF_MESSAGE_TYPE,  # Always treat as diff
-                    "trading_pair": trading_pair,
-                    "timestamp": timestamp,
-                    "update_id": update_id,
-                    "bids": bids,
-                    "asks": asks
-                }
-
-            elif abs(msg_type) == 3:  # Trade (Buy = 3, Sell = -3)
-                # Extract price and size
-                if len(data) < 56:
-                    return None
-
-                price, size = struct.unpack("<dd", data[40:56])
-                side = TradeType.BUY if msg_type > 0 else TradeType.SELL
-
-                # Create trade ID
-                trade_id = str(int(timestamp * 1000000))
-
-                # Log for debugging
-                self.logger().debug(f"Trade: {side.name}, {trading_pair}, price: {price}, size: {size}")
-
-                return {
-                    "type": CONSTANTS.TRADE_MESSAGE_TYPE,
-                    "trading_pair": trading_pair,
-                    "timestamp": timestamp,
-                    "trade_id": trade_id,
-                    "price": price,
-                    "amount": size,
-                    "trade_type": side
-                }
-
-            else:
-                self.logger().warning(f"Unknown message type: {msg_type}")
-                return None
-
-        except Exception as e:
-            self.logger().error(f"Error parsing binary message: {e}", exc_info=True)
-            return None
-
-    async def _process_binary_message(self, data: bytes, addr) -> None:
-        """
-        Process the binary message from UDP feed
-        """
-        if not data or len(data) < 40:  # Minimum header size
+        if not message:
             return
 
+        trading_pair = message.get("trading_pair")
+        if not trading_pair:
+            return
+
+        # Convert to diff message and queue
+        diff_msg = OrderBookMessage(
+            message_type=OrderBookMessageType.DIFF,
+            content={
+                "trading_pair": trading_pair,
+                "update_id": message["update_id"],
+                "bids": message["bids"],
+                "asks": message["asks"],
+            },
+            timestamp=message["timestamp"],
+        )
+        self._message_queue[self._diff_messages_queue_key].put_nowait(diff_msg)
+
+    async def _handle_depth_message(self, message: Dict[str, Any]):
+        """
+        Handle depth messages from UDP manager and convert to order book snapshot or diff message
+
+        :param message: Parsed depth message
+        """
+        # Generate a unique ID for this message instance for tracking
+        msg_id = f"depth_{int(time.time() * 1000)}"
+
+        if not message:
+            self.logger().warning(f"[{msg_id}] Received empty depth message")
+            return
+
+        trading_pair = message.get("trading_pair")
+        if not trading_pair:
+            self.logger().warning(
+                f"[{msg_id}] Depth message missing trading_pair field. Message keys: {list(message.keys())}"
+            )
+            return
+
+        # Get message details
+        bids_count = len(message.get("bids", []))
+        asks_count = len(message.get("asks", []))
+        update_id = message.get("update_id", "unknown")
+        timestamp = message.get("timestamp", time.time())
+        message_type = message.get("message_type", "unknown")
+        is_empty = trading_pair in self._empty_orderbook and self._empty_orderbook[trading_pair]
+
+        # More detailed logging for all messages during debugging
+        self.logger().info(
+            f"[{msg_id}] Processing depth message for {trading_pair}: "
+            f"type={message_type}, update_id={update_id}, bids={bids_count}, asks={asks_count}, "
+            f"is_empty_orderbook={is_empty}, timestamp={timestamp}"
+        )
+
+        # Log sample of bid/ask data to debug data quality
+        if bids_count > 0 or asks_count > 0:
+            # Sample of up to 3 bids/asks for logging
+            sample_bids = message.get("bids", [])[: min(3, bids_count)]
+            sample_asks = message.get("asks", [])[: min(3, asks_count)]
+
+            self.logger().debug(
+                f"[{msg_id}] Sample data for {trading_pair}:\n"
+                f"  Top bids (price, size): {sample_bids}\n"
+                f"  Top asks (price, size): {sample_asks}"
+            )
+        else:
+            self.logger().warning(f"[{msg_id}] No bids or asks in depth message for {trading_pair}")
+
+        # Determine if this should be a snapshot or diff
+        # Enhanced logic to ensure we create proper snapshots
+        should_create_snapshot = False
+        snapshot_reason = "none"
+
+        # Case 1: First message with data for an empty orderbook
+        if is_empty and (bids_count > 0 or asks_count > 0):
+            # The very first message with any data should be treated as a snapshot
+            should_create_snapshot = True
+            message["message_type"] = "snapshot"
+            snapshot_reason = "first_data_for_empty_book"
+            self.logger().info(f"[{msg_id}] Converting first non-empty depth message to snapshot for {trading_pair}")
+
+        # Case 2: Message explicitly marked as snapshot
+        elif message_type == "snapshot":
+            should_create_snapshot = True
+            snapshot_reason = "explicit_snapshot_flag"
+            self.logger().info(f"[{msg_id}] Processing explicit snapshot message for {trading_pair}")
+
+        # Case 3: Substantial data and book still marked as empty
+        elif bids_count >= 5 and asks_count >= 5 and is_empty:
+            # If we have substantial data and empty book, use as snapshot
+            # Reduced threshold to 5 from 10 to be more aggressive in creating snapshots
+            should_create_snapshot = True
+            message["message_type"] = "snapshot"
+            snapshot_reason = "substantial_data_empty_book"
+            self.logger().info(
+                f"[{msg_id}] Using depth message with {bids_count} bids, {asks_count} asks as snapshot for {trading_pair}"
+            )
+
+        # Case 4: Book has no asks or bids, but we have good data - create a snapshot
+        elif (bids_count >= 10 and asks_count >= 10) and hasattr(self._connector, "_order_book_tracker"):
+            # Check if current order book is empty or nearly empty
+            tracker = self._connector._order_book_tracker
+            if trading_pair in tracker.order_books and (
+                len(tracker.order_books[trading_pair].snapshot_bid_entries()) < 5
+                or len(tracker.order_books[trading_pair].snapshot_ask_entries()) < 5
+            ):
+
+                # Create a snapshot if current order book is sparse
+                should_create_snapshot = True
+                message["message_type"] = "snapshot"
+                snapshot_reason = "substantial_data_sparse_book"
+                self.logger().info(
+                    f"[{msg_id}] Creating snapshot from substantial depth message ({bids_count} bids, {asks_count} asks) "
+                    f"for {trading_pair} with sparse order book"
+                )
+
+        # Track current order book tracker state to diagnose issues
+        ob_tracker_state = "none"
+        if hasattr(self._connector, "_order_book_tracker") and self._connector._order_book_tracker is not None:
+            tracker = self._connector._order_book_tracker
+            if trading_pair in tracker.order_books:
+                bid_count = len(tracker.order_books[trading_pair].snapshot_bid_entries())
+                ask_count = len(tracker.order_books[trading_pair].snapshot_ask_entries())
+                ob_tracker_state = f"active_with_{bid_count}_bids_{ask_count}_asks"
+            else:
+                ob_tracker_state = "no_book_for_pair"
+        else:
+            ob_tracker_state = "no_tracker"
+
+        self.logger().debug(f"[{msg_id}] OB tracker state: {ob_tracker_state}")
+
         try:
-            # Parse the binary message
-            message = self._parse_binary_message(data)
+            if should_create_snapshot:
+                # Process as a SNAPSHOT
+                snapshot_msg = OrderBookMessage(
+                    message_type=OrderBookMessageType.SNAPSHOT,
+                    content={
+                        "trading_pair": trading_pair,
+                        "update_id": message["update_id"],
+                        "bids": message["bids"],
+                        "asks": message["asks"],
+                    },
+                    timestamp=message["timestamp"],
+                )
 
-            if message:
-                message_type = message.get("type")
-                trading_pair = message.get("trading_pair")
+                self.logger().info(
+                    f"[{msg_id}] Created orderbook SNAPSHOT for {trading_pair}: "
+                    f"bids={len(snapshot_msg.bids)}, asks={len(snapshot_msg.asks)}, "
+                    f"update_id={snapshot_msg.update_id}, reason={snapshot_reason}"
+                )
 
-                if message_type == CONSTANTS.TRADE_MESSAGE_TYPE:
-                    # Create trade message
-                    trade_msg = OrderBookMessage(
-                        message_type=OrderBookMessageType.TRADE,
-                        content={
-                            "trading_pair": trading_pair,
-                            "trade_type": float(message["trade_type"].value),
-                            "trade_id": message["trade_id"],
-                            "update_id": message["trade_id"],
-                            "price": Decimal(str(message["price"])),
-                            "amount": Decimal(str(message["amount"])),
-                        },
-                        timestamp=message["timestamp"]
-                    )
-                    await self._message_queue[self._trade_messages_queue_key].put(trade_msg)
+                # Queue the snapshot and track queue size for diagnostics
+                queue = self._message_queue[self._snapshot_messages_queue_key]
+                queue.put_nowait(snapshot_msg)
+                queue_size = queue.qsize()
+                self.logger().debug(f"[{msg_id}] Snapshot queue size after adding: {queue_size}")
 
-                elif message_type == CONSTANTS.DIFF_MESSAGE_TYPE:
-                    # Create diff message
-                    diff_msg = OrderBookMessage(
-                        message_type=OrderBookMessageType.DIFF,
-                        content={
-                            "trading_pair": trading_pair,
-                            "update_id": message["update_id"],
-                            "bids": [[Decimal(str(price)), Decimal(str(amount))] for price, amount in message["bids"]],
-                            "asks": [[Decimal(str(price)), Decimal(str(amount))] for price, amount in message["asks"]],
-                        },
-                        timestamp=message["timestamp"]
-                    )
-                    await self._message_queue[self._diff_messages_queue_key].put(diff_msg)
+                # Mark orderbook as no longer empty
+                self._empty_orderbook[trading_pair] = False
+            else:
+                # Process as a DIFF
+                diff_msg = OrderBookMessage(
+                    message_type=OrderBookMessageType.DIFF,
+                    content={
+                        "trading_pair": trading_pair,
+                        "update_id": message["update_id"],
+                        "bids": message["bids"],
+                        "asks": message["asks"],
+                    },
+                    timestamp=message["timestamp"],
+                )
 
+                # Log at info level for significant diffs, debug for small ones
+                log_method = self.logger().info if (bids_count >= 5 or asks_count >= 5) else self.logger().debug
+                log_method(
+                    f"[{msg_id}] Processing orderbook DIFF for {trading_pair}: "
+                    f"bids={len(diff_msg.bids)}, asks={len(diff_msg.asks)}, "
+                    f"update_id={diff_msg.update_id}, current_ob_state={ob_tracker_state}"
+                )
+
+                # Queue the diff and track queue size for diagnostics
+                queue = self._message_queue[self._diff_messages_queue_key]
+                queue.put_nowait(diff_msg)
+                queue_size = queue.qsize()
+                self.logger().debug(f"[{msg_id}] Diff queue size after adding: {queue_size}")
         except Exception as e:
-            self.logger().error(f"Error processing binary message: {e}", exc_info=True)
+            self.logger().error(f"[{msg_id}] Error processing depth message: {e}", exc_info=True)
 
-    async def _listen_for_trades_and_orderbooks(self) -> None:
+    async def _handle_trade_message(self, message: Dict[str, Any]):
         """
-        Listen for trades and orderbook updates from the UDP socket
+        Handle trade messages from UDP manager and convert to order book trade message
+
+        :param message: Parsed trade message
         """
-        buffer_size = CONSTANTS.DEFAULT_UDP_BUFFER_SIZE
+        if not message:
+            return
 
-        # Create a buffer for receiving data
-        recv_buffer = bytearray(buffer_size)
+        trading_pair = message.get("trading_pair")
+        if not trading_pair:
+            return
 
-        while True:
-            try:
-                if self._udp_socket is None:
-                    await asyncio.sleep(1)
-                    continue
+        # Convert to trade message and queue
+        trade_type = TradeType.BUY if message["side"] == "BUY" else TradeType.SELL
+        trade_msg = OrderBookMessage(
+            message_type=OrderBookMessageType.TRADE,
+            content={
+                "trading_pair": trading_pair,
+                "trade_type": trade_type,
+                "trade_id": message["trade_id"],
+                "update_id": int(message["timestamp"] * 1000),
+                "price": message["price"],
+                "amount": message["amount"],
+            },
+            timestamp=message["timestamp"],
+        )
+        self._message_queue[self._trade_messages_queue_key].put_nowait(trade_msg)
 
-                # Receive data from UDP socket (non-blocking way)
-                loop = asyncio.get_event_loop()
-                try:
-                    bytes_read, addr = await loop.run_in_executor(
-                        None,
-                        lambda: self._udp_socket.recvfrom_into(recv_buffer)
-                    )
-                except BlockingIOError:
-                    # No data available
-                    await asyncio.sleep(0.001)
-                    continue
-                except ConnectionRefusedError:
-                    self.logger().error("UDP connection refused. Attempting to reconnect...")
-                    await asyncio.sleep(1)
-                    self._udp_socket = web_utils.get_udp_socket(self._host, self._port)
-                    continue
+    # ---------------------------------------- End of Message Handling ----------------------------------------
 
-                if bytes_read == 0:
-                    await asyncio.sleep(0.001)
-                    continue
-
-                # Parse binary message
-                message = self._parse_binary_message(recv_buffer[:bytes_read])
-
-                if message:
-                    message_type = message.get("type")
-                    trading_pair = message.get("trading_pair")
-
-                    if message_type == CONSTANTS.TRADE_MESSAGE_TYPE:
-                        # Create trade message
-                        trade_msg = OrderBookMessage(
-                            message_type=OrderBookMessageType.TRADE,
-                            content={
-                                "trading_pair": trading_pair,
-                                "trade_type": float(message["trade_type"].value),
-                                "trade_id": message["trade_id"],
-                                "update_id": message["trade_id"],
-                                "price": Decimal(str(message["price"])),
-                                "amount": Decimal(str(message["amount"])),
-                            },
-                            timestamp=message["timestamp"]
-                        )
-                        await self._message_queue[self._trade_messages_queue_key].put(trade_msg)
-
-                    elif message_type == CONSTANTS.DIFF_MESSAGE_TYPE:
-                        # Create diff message
-                        diff_msg = OrderBookMessage(
-                            message_type=OrderBookMessageType.DIFF,
-                            content={
-                                "trading_pair": trading_pair,
-                                "update_id": message["update_id"],
-                                "bids": [[Decimal(str(price)), Decimal(str(amount))] for price, amount in message["bids"]],
-                                "asks": [[Decimal(str(price)), Decimal(str(amount))] for price, amount in message["asks"]],
-                            },
-                            timestamp=message["timestamp"]
-                        )
-                        await self._message_queue[self._diff_messages_queue_key].put(diff_msg)
-
-                # Prevent CPU hogging
-                await asyncio.sleep(0.00001)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().error(f"Unexpected error listening for market data: {e}", exc_info=True)
-                # Reconnect socket on failure
-                try:
-                    if self._udp_socket:
-                        self._udp_socket.close()
-                except Exception:
-                    pass
-
-                # Wait a moment before reconnecting
-                await asyncio.sleep(1)
-
-                # Attempt to reconnect
-                try:
-                    self._udp_socket = web_utils.get_udp_socket(self._host, self._port)
-                except Exception as e:
-                    self.logger().error(f"Error reconnecting to UDP socket: {e}")
-                    await asyncio.sleep(5)  # Wait longer after a reconnection failure
+    # ---------------------------------------- Queue Processing ----------------------------------------
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue) -> None:
         """
@@ -576,6 +504,10 @@ class QtxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 self.logger().error(f"Unexpected error listening for trades: {e}", exc_info=True)
                 await asyncio.sleep(1.0)
 
+    # ---------------------------------------- End of Queue Processing ----------------------------------------
+
+    # ---------------------------------------- Order Book Management ----------------------------------------
+
     async def get_new_order_book(self, trading_pair: str) -> OrderBook:
         """
         Create a new order book for a trading pair with an empty initial snapshot
@@ -590,31 +522,129 @@ class QtxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 "bids": snapshot["bids"],
                 "asks": snapshot["asks"],
             },
-            snapshot_timestamp)
+            snapshot_timestamp,
+        )
         order_book = self.order_book_create_function()
         order_book.apply_snapshot(snapshot_msg.bids, snapshot_msg.asks, snapshot_msg.update_id)
         return order_book
 
     async def get_snapshot(self, trading_pair: str) -> Dict:
         """
-        Give empty snapshot since QTX does not support order book snapshots,
-        and snapshots could be built after receiving enough diffs.
-        Indicating that we should build a warm-up phase once a strategy is running, and during warm-up,
-        the connector should be marked as not ready in Hummingbot.
+        Get an order book snapshot for a trading pair by directly collecting fresh market data.
+
+        This method collects fresh market data for every call and does not use caching.
+        It directly uses the UDP manager's collect_market_data() method to get the most
+        up-to-date order book snapshot for the specified trading pair.
+
+        :param trading_pair: Trading pair to get snapshot for (e.g. BTC-USDT)
+        :return: Dictionary with bids and asks lists
         """
-        return {
-            "bids": [],
-            "asks": []
-        }
+        req_id = f"snapshot_{int(time.time() * 1000)}"
+
+        self.logger().info(
+            f"[{req_id}] Getting fresh market data snapshot for {trading_pair} " f"with a 5-second collection window"
+        )
+
+        try:
+            # Collect fresh market data using the UDP manager (with 5-second duration)
+            collected_data = await self._udp_manager.collect_market_data(trading_pair, duration=5.0)
+
+            if collected_data.get("bids") or collected_data.get("asks"):
+                bids_count = len(collected_data.get("bids", []))
+                asks_count = len(collected_data.get("asks", []))
+
+                self.logger().info(
+                    f"[{req_id}] Successfully collected fresh market data for {trading_pair}: "
+                    f"{bids_count} bids, {asks_count} asks"
+                )
+                return collected_data
+            else:
+                self.logger().warning(f"[{req_id}] Collected market data for {trading_pair} is empty")
+        except Exception as e:
+            self.logger().error(f"[{req_id}] Error collecting market data for {trading_pair}: {e}", exc_info=True)
+
+        # If the collection fails, return empty snapshot
+        self.logger().warning(
+            f"[{req_id}] No market data available for {trading_pair} from any source. "
+            f"Returning empty snapshot which may cause issues with trading."
+        )
+        return {"bids": [], "asks": []}
+
+    # ---------------------------------------- End of Order Book Management ----------------------------------------
+
+    # ---------------------------------------- Funding Info ----------------------------------------
+
+    async def get_funding_info(self, trading_pair: str) -> FundingInfo:
+        """
+        Get funding information for a trading pair by delegating to Binance
+
+        :param trading_pair: Trading pair to get funding info for
+        :return: FundingInfo object or raises an exception if Binance data is unavailable
+        """
+        # Check if Binance connector is available
+        if self._connector.binance_connector is None:
+            raise ValueError("Cannot get funding info: Binance connector not initialized")
+
+        # Keep track of the original trading pair for consistent logging
+        # Convert directly to Binance format (remove the hyphen)
+        exchange_symbol = trading_pair.replace("-", "")
+
+        # Log the conversion for debugging
+        self.logger().info(f"Converting {trading_pair} to Binance format: {exchange_symbol} for funding info")
+
+        try:
+            # Try using the connector's get_funding_info if available
+            if hasattr(self._connector.binance_connector, "get_funding_info"):
+                return await self._connector.binance_connector.get_funding_info(trading_pair)
+        except KeyError as e:
+            self.logger().warning(
+                f"Funding info not found for {trading_pair} in Binance connector, falling back to API request: {e}"
+            )
+
+        try:
+            # Direct API call with exchange symbol (must be in uppercase for Binance)
+            data = await self._connector.binance_connector._api_request(
+                method=RESTMethod.GET,
+                path_url=BINANCE_CONSTANTS.MARK_PRICE_URL,
+                params={"symbol": exchange_symbol.upper()},
+                is_auth_required=False,
+            )
+
+            self.logger().info(f"Successfully retrieved funding info via API for {trading_pair}")
+            return FundingInfo(
+                trading_pair=trading_pair,  # Use original trading pair for consistency
+                index_price=Decimal(str(data.get("indexPrice", "0"))),
+                mark_price=Decimal(str(data.get("markPrice", "0"))),
+                next_funding_utc_timestamp=int(float(data.get("nextFundingTime", 0)) * 1e-3),
+                rate=Decimal(str(data.get("lastFundingRate", "0"))),
+            )
+        except Exception as e:
+            # We don't provide default values anymore - if Binance can't provide funding info,
+            # the connector should report this error appropriately
+            self.logger().error(f"Error getting funding info from Binance for {trading_pair}: {e}", exc_info=True)
+            raise ValueError(f"Cannot retrieve funding info for {trading_pair} from Binance: {e}")
 
     async def _listen_for_funding_info(self):
         """
-        Periodically fetch funding info updates from Binance
+        Periodically fetch funding info updates from Binance connector
         """
         while True:
             try:
+                # Check for each trading pair
                 for trading_pair in self._trading_pairs:
-                    await self.get_funding_info(trading_pair)
+                    # Get funding info using get_funding_info method
+                    funding_info = await self.get_funding_info(trading_pair)
+
+                    # Create funding info update and add to queue
+                    update = FundingInfoUpdate(
+                        trading_pair=trading_pair,
+                        index_price=funding_info.index_price,
+                        mark_price=funding_info.mark_price,
+                        rate=funding_info.rate,
+                        next_funding_utc_timestamp=funding_info.next_funding_utc_timestamp,
+                    )
+
+                    self._message_queue[self._funding_info_messages_queue_key].put_nowait(update)
 
                 # Check funding info every 60 seconds
                 await asyncio.sleep(60)
@@ -624,100 +654,65 @@ class QtxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 self.logger().error(f"Error listening for funding info: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-    def _parse_funding_info_message(self, message: Dict[str, Any], timestamp: Optional[float] = None) -> FundingInfoUpdate:
+    async def _parse_funding_info_message(
+        self, raw_message: Dict[str, Any], message_queue: Optional[asyncio.Queue] = None
+    ) -> FundingInfoUpdate:
         """
-        Parse funding info from Binance message format
+        Simple wrapper to convert funding info message format to FundingInfoUpdate
         """
-        if timestamp is None:
-            timestamp = time.time()
+        trading_pair = raw_message.get("trading_pair")
 
-        trading_pair = message.get("trading_pair")
-        if not trading_pair:
-            # Try to extract trading pair from symbol if available
-            symbol = message.get("symbol")
-            if symbol:
-                # Convert from exchange symbol to trading pair
-                trading_pair = self._connector.trading_pair_associated_to_exchange_symbol(symbol)
-
-        # Parse funding rate
-        funding_rate = Decimal(str(message.get("lastFundingRate", "0")))
-
-        # Parse index price
-        index_price = Decimal(str(message.get("indexPrice", "0")))
-
-        # Parse mark price
-        mark_price = Decimal(str(message.get("markPrice", "0")))
-
-        # Parse next funding time
-        next_funding_utc_timestamp = int(message.get("nextFundingTime", 0)) // 1000
+        # If trading pair is missing but symbol is present, convert it
+        if not trading_pair and "symbol" in raw_message:
+            try:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(raw_message["symbol"])
+            except Exception:
+                trading_pair = "UNKNOWN"  # Fallback
 
         return FundingInfoUpdate(
             trading_pair=trading_pair,
-            index_price=index_price,
-            mark_price=mark_price,
-            rate=funding_rate,
-            next_funding_utc_timestamp=next_funding_utc_timestamp
+            index_price=Decimal(str(raw_message.get("indexPrice", "0"))),
+            mark_price=Decimal(str(raw_message.get("markPrice", "0"))),
+            rate=Decimal(str(raw_message.get("lastFundingRate", "0"))),
+            next_funding_utc_timestamp=int(float(raw_message.get("nextFundingTime", 0)) * 1e-3),
         )
 
-    async def start(self):
+    async def listen_for_funding_info(self, output: asyncio.Queue):
         """
-        Starts the data source
+        Listen for funding info updates and forward to output queue
         """
-        # Start UDP socket listener
-        await self._subscribe_to_order_book_streams()
+        message_queue = self._message_queue[self._funding_info_messages_queue_key]
+        while True:
+            try:
+                funding_info_update = await message_queue.get()
+                output.put_nowait(funding_info_update)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Error in funding info listener: {e}")
+                await asyncio.sleep(5)
 
-        # Start funding info listener
-        if hasattr(self, "_funding_info_listener_task") and self._funding_info_listener_task is not None:
-            self._funding_info_listener_task.cancel()
-        self._funding_info_listener_task = asyncio.create_task(self._listen_for_funding_info())
+    # ---------------------------------------- End of Funding Info ----------------------------------------
 
-    async def stop(self):
+    # ---------------------------------------- WebSocket Interface (Dummy Implementation) ----------------------------------------
+    async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Stops the data source
+        This is a dummy method as we don't use WebSockets for QTX market data.
+        Used to satisfy the interface required by the base class.
         """
-        if self._listening_task is not None:
-            self._listening_task.cancel()
-            self._listening_task = None
+        # Since this method is being called by base class but we're not using it,
+        # we need to raise an informative error instead of NotImplementedError
+        self.logger().debug("WebSocket assistant requested but QTX uses UDP. This is likely called by the base class.")
+        # Create dummy/mock WSAssistant
+        ws_assistant = WSAssistant(self._connector.authenticator, api_factory=self._connector._web_assistants_factory)
+        return ws_assistant
 
-        if hasattr(self, "_funding_info_listener_task") and self._funding_info_listener_task is not None:
-            self._funding_info_listener_task.cancel()
-            self._funding_info_listener_task = None
+    async def _subscribe_channels(self, websocket_assistant: WSAssistant):
+        """
+        Dummy method as we don't use WebSockets for QTX market data.
+        """
+        pass
 
-        if self._udp_socket is not None:
-            # Unsubscribe from all symbols
-            for trading_pair in self._subscribed_pairs:
-                exchange_symbol = self._get_exchange_symbol_from_trading_pair(trading_pair)
-                try:
-                    # Set socket to blocking for unsubscribe
-                    self._udp_socket.setblocking(True)
-                    self._udp_socket.settimeout(1.0)
+    # ---------------------------------------- End of WebSocket Interface ----------------------------------------
 
-                    # Send unsubscribe request (prepend - to symbol)
-                    unsubscribe_msg = f"-{exchange_symbol}"
-                    self.logger().info(f"Unsubscribing from symbol: {exchange_symbol}")
-                    self._udp_socket.sendto(unsubscribe_msg.encode(), (self._host, self._port))
-
-                    # Wait for unsubscribe response
-                    try:
-                        response, _ = self._udp_socket.recvfrom(CONSTANTS.DEFAULT_UDP_BUFFER_SIZE)
-                        try:
-                            response_text = response.decode().strip()
-                            self.logger().info(f"Unsubscribe response for {exchange_symbol}: {response_text}")
-                        except UnicodeDecodeError:
-                            self.logger().info(f"Received binary unsubscribe response for {exchange_symbol}")
-                    except socket.timeout:
-                        self.logger().warning(f"Timeout waiting for unsubscribe ACK for {exchange_symbol}")
-                    except Exception as e:
-                        self.logger().error(f"Error getting unsubscribe response for {exchange_symbol}: {e}")
-                except Exception as e:
-                    self.logger().error(f"Error unsubscribing from {exchange_symbol}: {e}")
-
-            # Close the socket
-            self._udp_socket.close()
-            self._udp_socket = None
-
-            # Clear subscription data
-            self._subscription_indices = {}
-            self._subscribed_pairs = set()
-
-        self.logger().info("Funding info listener has been canceled")
+# ---------------------------------------- End of QtxPerpetualAPIOrderBookDataSource ----------------------------------------

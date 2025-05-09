@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 from decimal import Decimal
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from pydantic import Field, SecretStr
 
@@ -22,7 +22,7 @@ CENTRALIZED = True
 
 EXAMPLE_PAIR = "BTC-USDT"
 
-BROKER_ID = "QTX"
+BROKER_ID = "QTX_Perpetual"
 
 
 class QtxPerpetualConfigMap(BaseConnectorConfigMap):
@@ -85,48 +85,6 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
     :return: True if the exchange information is valid
     """
     return all(key in exchange_info.keys() for key in ["timezone", "serverTime", "symbols"])
-
-
-def format_trading_pair(trading_pair: str) -> str:
-    """
-    Format trading pair to match exchange's requirements.
-    Example: BTC-USDT -> btcusdt
-    """
-    return trading_pair.replace("-", "").lower()
-
-
-def convert_to_exchange_trading_pair(hb_trading_pair: str) -> str:
-    """
-    Convert from Hummingbot trading pair format to QTX perpetual UDP format.
-    Example: BTC-USDT -> binance-futures:btcusdt
-    """
-    formatted_pair = format_trading_pair(hb_trading_pair)
-    return f"binance-futures:{formatted_pair}"
-
-
-def convert_from_exchange_trading_pair(exchange_trading_pair: str) -> str:
-    """
-    Convert trading pair from exchange format to client format.
-    Example: binance-futures:btcusdt -> BTC-USDT
-    """
-    # Remove the exchange prefix if present
-    if ":" in exchange_trading_pair:
-        _, exchange_trading_pair = exchange_trading_pair.split(":", 1)
-
-    # Convert to lowercase for consistent processing
-    exchange_trading_pair = exchange_trading_pair.lower()
-
-    # Attempt to identify base and quote currencies
-    for quote in ["usdt", "busd", "usdc", "usd", "dai", "btc", "eth"]:
-        if exchange_trading_pair.endswith(quote):
-            base = exchange_trading_pair[: -len(quote)]
-            return f"{base.upper()}-{quote.upper()}"
-
-    # If we can't identify the split, return the original with a warning
-    import logging
-
-    logging.getLogger(__name__).warning(f"Could not parse exchange symbol: {exchange_trading_pair}. Returning as is.")
-    return exchange_trading_pair.upper()
 
 
 def get_exchange_order_type(order_type: OrderType) -> str:
@@ -208,60 +166,6 @@ def get_order_status_from_exchange_value(status: str) -> str:
     Convert exchange order status string to internal order status string.
     """
     return CONSTANTS.ORDER_STATE.get(status, "UNKNOWN")
-
-
-# Binance-specific utility functions
-
-def convert_to_binance_trading_pair(trading_pair: str) -> str:
-    """
-    Converts Hummingbot trading pair format to Binance format
-    Example: BTC-USDT -> BTCUSDT
-    """
-    return trading_pair.replace("-", "")
-
-
-def convert_from_binance_trading_pair(binance_symbol: str, trading_pairs: List[str]) -> str:
-    """
-    Converts Binance symbol to Hummingbot trading pair format
-    Example: BTCUSDT -> BTC-USDT
-
-    :param binance_symbol: The Binance symbol to convert
-    :param trading_pairs: List of available trading pairs to match against
-    :return: The converted trading pair in Hummingbot format
-    """
-    # First try direct conversion by checking if removing the dash matches
-    for tp in trading_pairs:
-        if binance_symbol == tp.replace("-", ""):
-            return tp
-
-    # If no direct match, try to identify base and quote
-    # Common quote currencies in perpetual futures
-    quote_currencies = ["USDT", "BUSD", "USDC", "USD", "BTC", "ETH"]
-
-    for quote in quote_currencies:
-        if binance_symbol.endswith(quote):
-            base = binance_symbol[:-len(quote)]
-            candidate = f"{base}-{quote}"
-            if candidate in trading_pairs:
-                return candidate
-
-    # If we still can't find a match, try a more sophisticated approach
-    # by checking all possible splits of the symbol
-    for i in range(1, len(binance_symbol)):
-        base = binance_symbol[:i]
-        quote = binance_symbol[i:]
-        candidate = f"{base}-{quote}"
-        if candidate in trading_pairs:
-            return candidate
-
-    # If all else fails, return a best guess
-    for quote in quote_currencies:
-        if binance_symbol.endswith(quote):
-            base = binance_symbol[:-len(quote)]
-            return f"{base}-{quote}"
-
-    # Last resort: just insert a dash before the last 4 characters
-    return f"{binance_symbol[:-4]}-{binance_symbol[-4:]}"
 
 
 def map_binance_order_status(binance_status: str) -> str:

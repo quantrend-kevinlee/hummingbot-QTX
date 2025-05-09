@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 
-import asyncio
-import socket
-import time
 from collections import defaultdict
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, AsyncIterable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants as BINANCE_CONSTANTS
@@ -13,29 +12,33 @@ from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivat
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.derivative.qtx_perpetual import (
     qtx_perpetual_constants as CONSTANTS,
-    qtx_perpetual_web_utils as web_utils,
+    qtx_perpetual_trading_pair_utils as trading_pair_utils,
 )
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_api_order_book_data_source import (
     QtxPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_auth import QtxPerpetualBinanceAuth
+from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_udp_manager import QtxPerpetualUDPManager
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_user_stream_data_source import (
     QtxPerpetualUserStreamDataSource,
 )
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.api_throttler.data_types import RateLimit
+from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 if TYPE_CHECKING:
     from hummingbot.client.config.config_helpers import ClientConfigAdapter
+
+
+# ---------------------------------------- Class Definition and Initialization ----------------------------------------
 
 
 class QtxPerpetualDerivative(PerpetualDerivativePyBase):
@@ -45,7 +48,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     This hybrid approach leverages QTX's market data with Binance's order execution capabilities.
     """
 
-    web_utils = web_utils
     SHORT_POLL_INTERVAL = 5.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     LONG_POLL_INTERVAL = 120.0
@@ -65,57 +67,86 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         self._qtx_perpetual_host = qtx_perpetual_host
         self._qtx_perpetual_port = qtx_perpetual_port
 
-        # Binance credentials for order execution (mainnet)
-        self.binance_api_key = binance_api_key
-        self.binance_api_secret = binance_api_secret
+        # Hold off on creating the UDP manager until it's actually needed
+        # This will be created on-demand in the property getter
+        self._udp_manager = None
 
+        # Binance API credentials for trading
+        self._binance_api_key = binance_api_key
+        self._binance_api_secret = binance_api_secret
+        self._domain = domain
+
+        # Trading flags
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        self._domain = domain
-        self._funding_payment_span = CONSTANTS.FUNDING_SETTLEMENT_DURATION
 
         # Initialize state for position tracking and funding info
         self._positions_cache: Dict[str, Dict[PositionSide, Position]] = defaultdict(dict)
         self._funding_info = {}
 
-        # Warm-up related variables
-        self._ready = False
-        self._warm_up_start_time = 0
+        # Initialize trading pair symbols map (bidict for bidirectional mapping)
+        self._trading_pair_symbol_map = bidict()
 
-        # Initialize the base class
+        # Initialize binance connector first
+        self._binance_connector_instance = None
+
+        # Initialize the base class after binance connector initialization
         super().__init__(client_config_map)
 
-        # Initialize Binance connector AFTER super().__init__ to ensure throttler is created
-        self._binance_derivative = None
-        if trading_required and binance_api_key and binance_api_secret:
-            self._init_binance_connector()
+        self._init_binance_connector()
+
+    # ---------------------------------------- Binance Connector Initialization ----------------------------------------
 
     def _init_binance_connector(self):
         """
         Initialize the Binance connector for order execution delegation
         """
-        self._binance_derivative = BinancePerpetualDerivative(
-            client_config_map=self._client_config,
-            binance_perpetual_api_key=self.binance_api_key,
-            binance_perpetual_api_secret=self.binance_api_secret,
-            trading_pairs=self._trading_pairs,
-            trading_required=self._trading_required,
-            domain=self._domain
-        )
-        # Share the throttler to coordinate rate limiting
-        self._binance_derivative._throttler = self._throttler
+        try:
+            # Initialize the Binance connector with the same parameters
+            binance_instance = BinancePerpetualDerivative(
+                client_config_map=self._client_config,
+                binance_perpetual_api_key=self._binance_api_key,
+                binance_perpetual_api_secret=self._binance_api_secret,
+                trading_pairs=self._trading_pairs,
+                trading_required=self._trading_required,
+                domain=self._domain,
+            )
+
+            # Store the instance using the setter
+            self._binance_connector_instance = binance_instance
+
+            self.logger().info("_init_binance_connector() is called successfully")
+        except Exception as e:
+            self._binance_connector_instance = None
+            self.logger().error(
+                f"Failed to initialize Binance connector in _init_binance_connector(): {str(e)}", exc_info=True
+            )
+            raise
+
+    # ---------------------------------------- Properties and Accessors ----------------------------------------ßß
 
     @property
-    def _binance_connector(self) -> BinancePerpetualDerivative:
+    def binance_connector(self) -> BinancePerpetualDerivative:
         """
-        Returns the Binance connector instance, initializing it if necessary
+        Returns the Binance connector instance
         """
-        if self._binance_derivative is None and self._trading_required:
-            if self.binance_api_key and self.binance_api_secret:
-                self._init_binance_connector()
-            else:
-                raise ValueError("Binance API credentials required for trading")
-        return self._binance_derivative
+        return self._binance_connector_instance
+
+    @binance_connector.setter
+    def binance_connector(self, value):
+        """
+        Sets the Binance connector instance
+        """
+        self._binance_connector_instance = value
+
+    @property
+    def udp_manager(self):
+        """
+        Returns the UDP manager instance, creating it if it doesn't exist yet
+        """
+        if self._udp_manager is None:
+            self._udp_manager = QtxPerpetualUDPManager(host=self._qtx_perpetual_host, port=self._qtx_perpetual_port)
+        return self._udp_manager
 
     @property
     def name(self) -> str:
@@ -123,12 +154,17 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def authenticator(self) -> QtxPerpetualBinanceAuth:
-        # Only need Binance authentication, QTX market data doesn't require auth
         return QtxPerpetualBinanceAuth(
-            binance_api_key=self.binance_api_key,
-            binance_api_secret=self.binance_api_secret,
-            time_provider=self._time_synchronizer
+            binance_api_key=self._binance_api_key,
+            binance_api_secret=self._binance_api_secret,
+            time_provider=self._time_synchronizer,
         )
+
+    @property
+    def web_utils(self):
+        from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_web_utils
+
+        return qtx_perpetual_web_utils
 
     @property
     def rate_limits_rules(self) -> List[RateLimit]:
@@ -159,49 +195,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         return BINANCE_CONSTANTS.PING_URL
 
     @property
-    def ready(self) -> bool:
-        """
-        Checks if the connector is ready for trading.
-        Returns True if:
-        1. All markets are ready
-        2. The warm-up period has elapsed (preventing trading during orderbook initialization)
-        """
-        # Check if the base class implementation is ready
-        base_ready = super().ready
-
-        # If base ready, also check if the warm-up period has elapsed
-        if base_ready and not self._ready:
-            # Check if warm-up period has elapsed
-            if self._warm_up_start_time > 0 and time.time() >= self._warm_up_start_time + CONSTANTS.ORDERBOOK_WARMUP_TIME:
-                self.logger().info("QTX Perpetual connector warm-up period completed.")
-                self._ready = True
-
-        return base_ready and self._ready
-
-    async def check_network(self) -> NetworkStatus:
-        """
-        Checks UDP connectivity to the QTX feed and Binance API if trading is required
-        """
-        try:
-            # Check QTX UDP connection
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(1.0)
-            sock.sendto(b"", (self._qtx_perpetual_host, self._qtx_perpetual_port))
-            sock.close()
-
-            # Check Binance connection if trading is required
-            if self._trading_required:
-                binance_status = await self._binance_connector.check_network()
-                if binance_status != NetworkStatus.CONNECTED:
-                    self.logger().warning("Binance API connection check failed")
-                    return NetworkStatus.NOT_CONNECTED
-
-            return NetworkStatus.CONNECTED
-        except Exception as e:
-            self.logger().warning(f"Network check failed: {e}")
-            return NetworkStatus.NOT_CONNECTED
-
-    @property
     def trading_pairs(self):
         return self._trading_pairs
 
@@ -211,13 +204,73 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def is_trading_required(self) -> bool:
+        binance_instance = self.binance_connector
+        if binance_instance is not None:
+            self._trading_required = binance_instance.is_trading_required
         return self._trading_required
 
     @property
-    def funding_fee_poll_interval(self) -> int:
-        return 600  # 10 minutes
+    def status_dict(self) -> Dict[str, bool]:
+        status_dict = super().status_dict
+        self.logger().info(f"QTX Perpetual status check: {status_dict}")
+        return status_dict
 
-    # Market data methods (use QTX implementation)
+    @property
+    def funding_fee_poll_interval(self) -> int:
+        binance_instance = self.binance_connector
+        if binance_instance is not None:
+            return binance_instance.funding_fee_poll_interval
+        return 600
+
+    # ---------------------------------------- Network and Lifecycle Management ----------------------------------------
+
+    async def _make_network_check_request(self):
+        pass
+
+    async def start_network(self):
+        """
+        Start network components
+        """
+        await super().start_network()
+
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: start_network() failed")
+            return
+        else:
+            await binance_instance.start_network()
+            self.logger().debug("Binance connector connector start_network() completed.")
+
+        self.logger().info("QTX Perpetual connector start_network() completed.")
+
+    async def stop_network(self):
+        """
+        Stop networking
+        """
+        await super().stop_network()
+
+        if self._udp_manager is not None:
+            for trading_pair in self._trading_pairs:
+                try:
+                    qtx_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair)
+                    await self.udp_manager.unsubscribe_from_symbol(qtx_symbol)
+                except Exception as e:
+                    self.logger().error(f"Error unsubscribing from {trading_pair}: {e}")
+
+            await self.udp_manager.stop_listening()
+
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: stop_network() failed")
+            return
+        else:
+            await binance_instance.stop_network()
+            self.logger().debug("Binance connector connector stop_network() completed.")
+
+        self.logger().info("QTX Perpetual connector stop_network() completed.")
+
+    # ---------------------------------------- Data Source Creation ----------------------------------------
+
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """
         Create the order book tracker data source using QTX
@@ -229,29 +282,177 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             domain=self.domain,
             host=self._qtx_perpetual_host,
             port=self._qtx_perpetual_port,
+            udp_manager_instance=self.udp_manager,
         )
 
-    # User stream methods (use Binance implementation through delegation)
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         """
-        Create the user stream data source
-        This uses the Binance stream for order/position updates
+        Create a minimal user stream data source that merely delegates events from Binance to QTX's event queue.
         """
-        return QtxPerpetualUserStreamDataSource(
-            auth=self._auth,
-            connector=self,
-            api_factory=self._web_assistants_factory,
-            domain=self.domain,
-        )
+        return QtxPerpetualUserStreamDataSource(qtx_connector=self)
 
-    # All trading methods delegate to Binance connector
+    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+        """
+        Create a web assistants factory
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().info("Binance connector not available: _create_web_assistants_factory() failed")
+            return WebAssistantsFactory(throttler=self._throttler, auth=self.authenticator)
+        else:
+            return binance_instance._create_web_assistants_factory()
+
+    # ---------------------------------------- Trading Pair Management ----------------------------------------
+
+    async def _initialize_trading_pair_symbol_map(self):
+        """
+        Initialize the trading pair symbol map by fetching data from the exchange
+        and processing it using the _initialize_trading_pair_symbols_from_exchange_info method.
+        """
+        try:
+            exchange_info = await self._make_trading_pairs_request()
+            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+            self.logger().debug("_initialize_trading_pair_symbol_map() is called successfully")
+        except Exception as e:
+            self.logger().error(f"Error initializing trading pair symbol map: {e}", exc_info=True)
+            raise
+
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+        """
+        Initialize trading pair symbols from exchange info - directly delegates to Binance connector.
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error(
+                "Binance connector not available: _initialize_trading_pair_symbols_from_exchange_info() failed"
+            )
+            return
+
+        try:
+            binance_instance._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
+
+            # Copy back the trading pair symbol map from Binance connector
+            self.logger().info(
+                f"Binance trading pair symbol map before copy: {binance_instance._trading_pair_symbol_map}"
+            )
+            self._set_trading_pair_symbol_map(binance_instance._trading_pair_symbol_map.copy())
+            self.logger().info(f"QTX trading pair symbol map after copy: {self._trading_pair_symbol_map}")
+
+            self.logger().debug("_initialize_trading_pair_symbols_from_exchange_info() is called successfully")
+        except Exception as e:
+            self.logger().error(
+                f"Error during delegation in _initialize_trading_pair_symbols_from_exchange_info(): {e}", exc_info=True
+            )
+
+    async def exchange_symbol_associated_to_pair(self, trading_pair: str) -> str:
+        """
+        Used to translate a trading pair from Hummingbot format to Binance format
+        """
+        return trading_pair_utils.convert_to_binance_trading_pair(trading_pair)
+
+    async def trading_pair_associated_to_exchange_symbol(self, symbol: str) -> str:
+        """
+        Used to translate a trading pair from Binance format to Hummingbot format
+        """
+        return trading_pair_utils.convert_from_binance_trading_pair(symbol, self._trading_pairs)
+
+    async def all_trading_pairs(self) -> List[str]:
+        """
+        Get all trading pairs from Binance
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: all_trading_pairs failed")
+            return []
+
+        try:
+            return await binance_instance.all_trading_pairs()
+        except Exception as e:
+            self.logger().error(f"Error in all_trading_pairs: {e}", exc_info=True)
+            return []
+
+    async def _make_trading_pairs_request(self) -> Any:
+        """
+        Delegates trading pairs request to Binance connector.
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _make_trading_pairs_request failed")
+            return {}
+
+        try:
+            return await binance_instance._make_trading_pairs_request()
+        except Exception as e:
+            self.logger().error(f"Error in _make_trading_pairs_request: {e}", exc_info=True)
+            return {}
+
+    async def _update_trading_rules(self) -> None:
+        """
+        Update QTX trading rules by delegating to the Binance sub-connector and copying the updated data back.
+        """
+        if self.binance_connector is None:
+            self.logger().warning(
+                "Cannot update trading rules because binance_connector is not available. "
+                "Skipping _update_trading_rules."
+            )
+            return
+
+        try:
+            # Ask the Binance sub-connector to update its own trading rules
+            await self.binance_connector._update_trading_rules()
+
+            # Copy the trading rules from Binance into QTX
+            self._trading_rules = self.binance_connector._trading_rules.copy()
+
+            # Copy the trading pari symbol map from the Binance connector with careful error handling
+            symbol_map = await self.binance_connector.trading_pair_symbol_map()
+            if symbol_map:
+                self._set_trading_pair_symbol_map(symbol_map.copy())
+                self.logger().debug(
+                    f"Successfully updated trading rules and symbol map from Binance. "
+                    f"QTX symbols_mapping_initialized={self.trading_pair_symbol_map_ready()}"
+                )
+            else:
+                self.logger().info(
+                    "Binance connector returned an empty symbol map. Trading rules updated, "
+                    "but no symbol map to copy."
+                )
+
+        except Exception as e:
+            self.logger().error(
+                f"Error in QTX _update_trading_rules during delegation to binance_connector: {e}", exc_info=True
+            )
+
+    async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
+        """
+        Format trading rules - delegate to Binance connector.
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _format_trading_rules failed")
+            return []
+
+        try:
+            return await binance_instance._format_trading_rules(exchange_info_dict)
+        except Exception as e:
+            self.logger().error(f"Error in _format_trading_rules: {e}", exc_info=True)
+            return []
+
+    # ---------------------------------------- Order Placement and Management ----------------------------------------
+
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         """
         Delegate order cancellation to Binance connector
         """
-        if self._trading_required:
-            return await self._binance_connector._place_cancel(order_id, tracked_order)
-        return False
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            raise ValueError("Binance connector not available: _place_cancel failed")
+
+        try:
+            return await binance_instance._place_cancel(order_id=order_id, tracked_order=tracked_order)
+        except Exception as e:
+            self.logger().error(f"Error in _place_cancel: {e}", exc_info=True)
+            raise
 
     async def _place_order(
         self,
@@ -267,8 +468,12 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Delegate order placement to Binance connector
         """
-        if self._trading_required:
-            return await self._binance_connector._place_order(
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            raise ValueError("Binance connector not available: _place_order failed")
+
+        try:
+            return await binance_instance._place_order(
                 order_id=order_id,
                 trading_pair=trading_pair,
                 amount=amount,
@@ -276,189 +481,302 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 order_type=order_type,
                 price=price,
                 position_action=position_action,
-                **kwargs
+                **kwargs,
             )
-        return "", 0.0
+        except Exception as e:
+            self.logger().error(f"Error in _place_order: {e}", exc_info=True)
+            raise
 
-    async def _update_trading_rules(self):
+    def _is_order_not_found_during_cancelation_error(self, exception) -> bool:
         """
-        Delegate trading rules update to Binance connector
+        Determine if an error from cancel order request is due to order not found
         """
-        if self._trading_required:
-            await self._binance_connector._update_trading_rules()
-            self._trading_rules = self._binance_connector._trading_rules
-        else:
-            self._trading_rules = {}
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _is_order_not_found_during_cancelation_error failed")
+            return "Order does not exist" in str(exception) or "Unknown order" in str(exception)
+
+        try:
+            return binance_instance._is_order_not_found_during_cancelation_error(exception)
+        except Exception as e:
+            self.logger().error(f"Error in _is_order_not_found_during_cancelation_error: {e}", exc_info=True)
+            return "Order does not exist" in str(exception) or "Unknown order" in str(exception)
+
+    def _is_order_not_found_during_status_update_error(self, exception) -> bool:
+        """
+        Determine if an error from order status request is due to order not found
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error(
+                "Binance connector not available: _is_order_not_found_during_status_update_error failed"
+            )
+            return "Order does not exist" in str(exception) or "Unknown order" in str(exception)
+
+        try:
+            return binance_instance._is_order_not_found_during_status_update_error(exception)
+        except Exception as e:
+            self.logger().error(f"Error in _is_order_not_found_during_status_update_error: {e}", exc_info=True)
+            return "Order does not exist" in str(exception) or "Unknown order" in str(exception)
+
+    def _is_request_exception_related_to_time_synchronizer(self, request_exception) -> bool:
+        """
+        Determine if a request exception is related to timestamp synchronization
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error(
+                "Binance connector not available: _is_request_exception_related_to_time_synchronizer failed"
+            )
+            return "Timestamp for this request" in str(request_exception) and "reconfigure it" in str(request_exception)
+
+        try:
+            return binance_instance._is_request_exception_related_to_time_synchronizer(request_exception)
+        except Exception as e:
+            self.logger().error(f"Error in _is_request_exception_related_to_time_synchronizer: {e}", exc_info=True)
+            return "Timestamp for this request" in str(request_exception) and "reconfigure it" in str(request_exception)
+
+    # ---------------------------------------- Status Polling and Updates ----------------------------------------
+
+    async def _status_polling_loop_fetch_updates(self):
+        """
+        Fetches updates for orders, trades, balances and positions
+        """
+        from hummingbot.core.utils.async_utils import safe_gather
+
+        await safe_gather(
+            self._update_order_fills_from_trades(),
+            self._update_order_status(),
+            self._update_balances(),
+            self._update_positions(),
+        )
+
+    async def _update_order_fills_from_trades(self):
+        """
+        Get order trade updates from the exchange and update order status
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _update_order_fills_from_trades failed")
+            return
+
+        try:
+            await binance_instance._update_order_fills_from_trades()
+        except Exception as e:
+            self.logger().error(f"Error in _update_order_fills_from_trades: {e}", exc_info=True)
+
+    async def _update_order_status(self):
+        """
+        Get order status updates from the exchange
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _update_order_status failed")
+            return
+
+        try:
+            await binance_instance._update_order_status()
+        except Exception as e:
+            self.logger().error(f"Error in _update_order_status: {e}", exc_info=True)
 
     async def _update_balances(self):
         """
-        Retrieve balances from Binance API
-        This method will attempt to get balances regardless of trading_required flag
+        Update balances - directly delegate to Binance connector
         """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _update_balances failed")
+            return
 
         try:
-            # Ensure Binance connector is initialized and working (if we have credentials)
-            if self.binance_api_key and self.binance_api_secret:
-                if self._binance_derivative is None:
-                    self._init_binance_connector()
-
-                # Log domain and URL information
-                self.logger().debug(f"Fetching balance from Binance API using domain: {self._domain}")
-
-                # Directly update balances from Binance API
-                account_info = await self._api_get(
-                    path_url=BINANCE_CONSTANTS.ACCOUNT_INFO_URL,
-                    is_auth_required=True,
-                    limit_id=BINANCE_CONSTANTS.ACCOUNT_INFO_URL
-                )
-
-                # Log the structure of account_info for debugging
-                self.logger().debug(f"Account info keys: {account_info.keys() if isinstance(account_info, dict) else 'Not a dict'}")
-
-                # Process the balances from the account info
-                if "assets" in account_info:
-                    assets = account_info.get("assets", [])
-                    self.logger().debug(f"Received {len(assets)} assets from Binance")
-
-                    # For debugging, log a sample asset if available
-                    if len(assets) > 0:
-                        self.logger().debug(f"Sample asset structure: {assets[0]}")
-
-                    local_asset_names = set(self._account_balances.keys())
-                    remote_asset_names = set()
-
-                    for asset in assets:
-                        asset_name = asset.get("asset")
-
-                        # Skip assets with zero balance
-                        wallet_balance = Decimal(str(asset.get("walletBalance", "0")))
-                        if wallet_balance == Decimal("0"):
-                            continue
-
-                        available_balance = Decimal(str(asset.get("availableBalance", "0")))
-
-                        self.logger().debug(f"Processing asset: {asset_name}, wallet: {wallet_balance}, available: {available_balance}")
-
-                        self._account_available_balances[asset_name] = available_balance
-                        self._account_balances[asset_name] = wallet_balance
-                        remote_asset_names.add(asset_name)
-
-                    # Log updated balances - Keep this as INFO since it's important
-                    non_zero_balances = {k: v for k, v in self._account_balances.items() if v > 0}
-                    if non_zero_balances:
-                        self.logger().info(f"Updated balances: {', '.join([f'{k}: {v}' for k, v in non_zero_balances.items()])}")
-                    else:
-                        self.logger().debug("No non-zero balances found")
-
-                    # Remove any assets no longer present
-                    asset_names_to_remove = local_asset_names.difference(remote_asset_names)
-                    for asset_name in asset_names_to_remove:
-                        del self._account_available_balances[asset_name]
-                        del self._account_balances[asset_name]
-                else:
-                    self.logger().error(f"Error updating balances: account_info does not contain 'assets' key. Keys: {account_info.keys()}")
-            else:
-                self.logger().debug("Skipping balance update: Binance API credentials not provided")
-                self._account_balances = {}
-                self._account_available_balances = {}
+            await binance_instance._update_balances()
+            self._account_available_balances = binance_instance._account_available_balances.copy()
+            self._account_balances = binance_instance._account_balances.copy()
         except Exception as e:
-            # Log the error but don't crash
-            self.logger().error(f"Error updating balances: {str(e)}", exc_info=True)
-            # Set empty balances on error
-            self._account_balances = {}
-            self._account_available_balances = {}
+            self.logger().error(f"Error in _update_balances: {e}", exc_info=True)
 
     async def _update_positions(self):
         """
-        Delegate position updates to Binance connector
+        Update positions - delegate to Binance directly
         """
-        if self._trading_required:
-            await self._binance_connector._update_positions()
-            # Copy positions from Binance to our local cache
-            for trading_pair, positions in self._binance_connector._perpetual_trading._positions.items():
-                for position_side, position in positions.items():
-                    self._perpetual_trading.set_position(
-                        self._perpetual_trading.position_key(trading_pair, position_side),
-                        position
-                    )
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _update_positions failed")
+            return
+
+        try:
+            await binance_instance._update_positions()
+            self._positions_cache = {}
+
+            for trading_pair in binance_instance._perpetual_trading._trading_pairs:
+                for position_side in [PositionSide.LONG, PositionSide.SHORT]:
+                    position = binance_instance._perpetual_trading.get_position(trading_pair, position_side)
+                    if position is not None:
+                        if trading_pair not in self._positions_cache:
+                            self._positions_cache[trading_pair] = {}
+                        self._positions_cache[trading_pair][position_side] = position
+        except Exception as e:
+            self.logger().error(f"Error in _update_positions: {e}", exc_info=True)
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
         Delegate order status request to Binance connector
         """
-        if self._trading_required:
-            return await self._binance_connector._request_order_status(tracked_order)
-        return OrderUpdate(
-            trading_pair=tracked_order.trading_pair,
-            update_timestamp=self.current_timestamp,
-            new_state=tracked_order.current_state,
-            client_order_id=tracked_order.client_order_id,
-        )
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _request_order_status failed")
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=tracked_order.current_state,
+            )
+
+        try:
+            return await binance_instance._request_order_status(tracked_order)
+        except Exception as e:
+            self.logger().error(f"Error in _request_order_status: {e}", exc_info=True)
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=tracked_order.current_state,
+            )
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         """
         Delegate trade updates request to Binance connector
         """
-        if self._trading_required:
-            return await self._binance_connector._all_trade_updates_for_order(order)
-        return []
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _all_trade_updates_for_order failed")
+            return []
 
-    async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
-        """
-        Delegate fee payment request to Binance connector
-        """
-        if self._trading_required:
-            return await self._binance_connector._fetch_last_fee_payment(trading_pair)
-        return 0, Decimal("-1"), Decimal("-1")
+        try:
+            return await binance_instance._all_trade_updates_for_order(order)
+        except Exception as e:
+            self.logger().error(f"Error in _all_trade_updates_for_order: {e}", exc_info=True)
+            return []
 
-    # Order type and position mode support
+    # ---------------------------------------- User Stream Management ----------------------------------------
+
+    async def _user_stream_event_listener(self):
+        """
+        No-op because we delegate all user stream events to the Binance sub-connector.
+        """
+        pass
+
+    def _is_user_stream_initialized(self) -> bool:
+        """
+        QTX delegates all user-stream to binance sub-connector. If binance says it's initialized, we do too.
+        """
+        if not self.is_trading_required:
+            return True
+
+        if self._binance_connector_instance is not None:
+            return self._binance_connector_instance._is_user_stream_initialized()
+        else:
+            self.logger().error("Binance connector not available: _is_user_stream_initialized failed")
+
+        return False
+
+    # ---------------------------------------- Trading Configuration ----------------------------------------
+
     def supported_order_types(self) -> List[OrderType]:
         """
         Returns order types supported by the connector
         """
+        binance_instance = self.binance_connector
+        if binance_instance is not None:
+            return binance_instance.supported_order_types()
         return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
     def supported_position_modes(self):
         """
         Returns supported position modes
         """
+        binance_instance = self.binance_connector
+        if binance_instance is not None:
+            return binance_instance.supported_position_modes()
         return [PositionMode.ONEWAY, PositionMode.HEDGE]
 
-    # Set leverage and position mode (delegate to Binance)
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
         """
         Delegate leverage setting to Binance connector
         """
-        if self._trading_required:
-            return await self._binance_connector._set_trading_pair_leverage(trading_pair, leverage)
-        return False, "Trading not enabled"
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _set_trading_pair_leverage failed")
+            return False, "Binance connector not available"
+
+        try:
+            return await binance_instance._set_trading_pair_leverage(trading_pair, leverage)
+        except Exception as e:
+            self.logger().error(f"Error in _set_trading_pair_leverage: {e}", exc_info=True)
+            return False, f"Binance operation failed: {str(e)}"
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         """
         Delegate position mode setting to Binance connector
         """
-        if self._trading_required:
-            return await self._binance_connector._trading_pair_position_mode_set(mode, trading_pair)
-        return False, "Trading not enabled"
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _trading_pair_position_mode_set failed")
+            return False, "Binance connector not available"
 
-    # Fees and trading info
+        try:
+            return await binance_instance._trading_pair_position_mode_set(mode, trading_pair)
+        except Exception as e:
+            self.logger().error(f"Error in _trading_pair_position_mode_set: {e}", exc_info=True)
+            return False, f"Binance operation failed: {str(e)}"
+
+    # ---------------------------------------- Fees and Collateral ----------------------------------------
+
+    async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
+        """
+        Delegate last fee payment fetch to Binance connector
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: _fetch_last_fee_payment failed")
+            return 0, Decimal("0"), Decimal("0")
+
+        try:
+            return await binance_instance._fetch_last_fee_payment(trading_pair)
+        except Exception as e:
+            self.logger().error(f"Error in _fetch_last_fee_payment: {e}", exc_info=True)
+            return 0, Decimal("0"), Decimal("0")
+
     def get_buy_collateral_token(self, trading_pair: str) -> str:
         """
-        Returns the collateral token for buy orders
+        Retrieve the collateral token for buying
         """
-        if self._trading_required and trading_pair in self._trading_rules:
-            return self._trading_rules[trading_pair].buy_order_collateral_token
-        base, quote = trading_pair.split("-")
-        return quote
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            return ""
+
+        try:
+            return binance_instance.get_buy_collateral_token(trading_pair)
+        except Exception as e:
+            self.logger().error(f"Error in get_buy_collateral_token: {e}", exc_info=True)
+            return ""
 
     def get_sell_collateral_token(self, trading_pair: str) -> str:
         """
-        Returns the collateral token for sell orders
+        Retrieve the collateral token for selling
         """
-        if self._trading_required and trading_pair in self._trading_rules:
-            return self._trading_rules[trading_pair].sell_order_collateral_token
-        base, quote = trading_pair.split("-")
-        return quote
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: get_sell_collateral_token failed")
+            return ""
+
+        try:
+            return binance_instance.get_sell_collateral_token(trading_pair)
+        except Exception as e:
+            self.logger().error(f"Error in get_sell_collateral_token: {e}", exc_info=True)
+            return ""
 
     def _get_fee(
         self,
@@ -471,6 +789,25 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         price: Decimal = s_decimal_NaN,
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
+        """
+        Calculate fee for orders
+        """
+        binance_instance = self.binance_connector
+        if binance_instance is not None:
+            try:
+                return binance_instance._get_fee(
+                    base_currency=base_currency,
+                    quote_currency=quote_currency,
+                    order_type=order_type,
+                    order_side=order_side,
+                    position_action=position_action,
+                    amount=amount,
+                    price=price,
+                    is_maker=is_maker,
+                )
+            except Exception as e:
+                self.logger().error(f"Error in _get_fee: {e}", exc_info=True)
+
         is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
         return build_trade_fee(
             self.name,
@@ -483,305 +820,85 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             price=price,
         )
 
-    # User stream event processing - delegate to Binance connector
-    async def _user_stream_event_listener(self):
-        async for event_message in self._iter_user_event_queue():
-            try:
-                event_type = event_message.get("e")
-                if event_type == "ORDER_TRADE_UPDATE":
-                    # Process order update
-                    await self._process_user_stream_order_update(event_message)
-                elif event_type == "ACCOUNT_UPDATE":
-                    # Process account update
-                    await self._process_user_stream_account_update(event_message)
-                elif event_type == "MARGIN_CALL":
-                    # Process margin call
-                    await self._process_user_stream_margin_call(event_message)
-                elif event_type == "ACCOUNT_CONFIG_UPDATE":
-                    # Process account config update
-                    await self._process_user_stream_config_update(event_message)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().error(f"Unexpected error in user stream listener loop: {e}", exc_info=True)
-                await self._sleep(5.0)
-
-    async def _process_user_stream_order_update(self, event_message: Dict[str, Any]):
-        order_message = event_message.get("o")
-        if order_message:
-            client_order_id = order_message.get("c", None)
-            tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-            if tracked_order is not None:
-                # Process trade update if applicable
-                trade_id = str(order_message["t"])
-                if trade_id != "0":  # Indicates there has been a trade
-                    await self._process_trade_update_from_order_message(tracked_order, order_message)
-
-                # Process order status update
-                order_update = OrderUpdate(
-                    trading_pair=tracked_order.trading_pair,
-                    update_timestamp=event_message["T"] * 1e-3,
-                    new_state=BINANCE_CONSTANTS.ORDER_STATE[order_message["X"]],
-                    client_order_id=client_order_id,
-                    exchange_order_id=str(order_message["i"]),
-                )
-                self._order_tracker.process_order_update(order_update)
-
-    async def _process_trade_update_from_order_message(self, tracked_order: InFlightOrder, order_message: Dict[str, Any]):
-        trade_id = str(order_message["t"])
-        client_order_id = tracked_order.client_order_id
-
-        fee_asset = order_message.get("N", tracked_order.quote_asset)
-        fee_amount = Decimal(order_message.get("n", "0"))
-        position_side = order_message.get("ps", "LONG")
-        position_action = (PositionAction.OPEN
-                           if (tracked_order.trade_type is TradeType.BUY and position_side == "LONG"
-                               or tracked_order.trade_type is TradeType.SELL and position_side == "SHORT")
-                           else PositionAction.CLOSE)
-        flat_fees = [] if fee_amount == Decimal("0") else [TokenAmount(amount=fee_amount, token=fee_asset)]
-
-        fee = TradeFeeBase.new_perpetual_fee(
-            fee_schema=self.trade_fee_schema(),
-            position_action=position_action,
-            percent_token=fee_asset,
-            flat_fees=flat_fees,
-        )
-
-        trade_update = TradeUpdate(
-            trade_id=trade_id,
-            client_order_id=client_order_id,
-            exchange_order_id=str(order_message["i"]),
-            trading_pair=tracked_order.trading_pair,
-            fill_timestamp=order_message["T"] * 1e-3,
-            fill_price=Decimal(order_message["L"]),
-            fill_base_amount=Decimal(order_message["l"]),
-            fill_quote_amount=Decimal(order_message["L"]) * Decimal(order_message["l"]),
-            fee=fee,
-        )
-        self._order_tracker.process_trade_update(trade_update)
-
-    async def _process_user_stream_account_update(self, event_message: Dict[str, Any]):
-        update_data = event_message.get("a", {})
-
-        # Update balances
-        for asset in update_data.get("B", []):
-            asset_name = asset["a"]
-            self._account_balances[asset_name] = Decimal(asset["wb"])
-            self._account_available_balances[asset_name] = Decimal(asset["cw"])
-
-        # Update positions
-        for asset in update_data.get("P", []):
-            trading_pair = asset["s"]
-            try:
-                hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
-            except KeyError:
-                # Ignore results for which their symbols is not tracked by the connector
-                continue
-
-            side = PositionSide[asset['ps']]
-            position = self._perpetual_trading.get_position(hb_trading_pair, side)
-            if position is not None:
-                amount = Decimal(asset["pa"])
-                if amount == Decimal("0"):
-                    pos_key = self._perpetual_trading.position_key(hb_trading_pair, side)
-                    self._perpetual_trading.remove_position(pos_key)
-                else:
-                    position.update_position(position_side=PositionSide[asset["ps"]],
-                                             unrealized_pnl=Decimal(asset["up"]),
-                                             entry_price=Decimal(asset["ep"]),
-                                             amount=Decimal(asset["pa"]))
-            else:
-                await self._update_positions()
-
-    async def _process_user_stream_margin_call(self, event_message: Dict[str, Any]):
-        positions = event_message.get("p", [])
-        total_maint_margin_required = Decimal(0)
-        negative_pnls_msg = ""
-
-        for position in positions:
-            trading_pair = position["s"]
-            try:
-                hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
-            except KeyError:
-                continue
-
-            existing_position = self._perpetual_trading.get_position(hb_trading_pair, PositionSide[position['ps']])
-            if existing_position is not None:
-                existing_position.update_position(position_side=PositionSide[position["ps"]],
-                                                  unrealized_pnl=Decimal(position["up"]),
-                                                  amount=Decimal(position["pa"]))
-
-            total_maint_margin_required += Decimal(position.get("mm", "0"))
-            if float(position.get("up", 0)) < 1:
-                negative_pnls_msg += f"{hb_trading_pair}: {position.get('up')}, "
-
-        self.logger().warning("Margin Call: Your position risk is too high, and you are at risk of "
-                              "liquidation. Close your positions or add additional margin to your wallet.")
-        self.logger().info(f"Margin Required: {total_maint_margin_required}. "
-                           f"Negative PnL assets: {negative_pnls_msg}.")
-
-    async def _process_user_stream_config_update(self, event_message: Dict[str, Any]):
-        if "ac" in event_message:
-            ac_data = event_message["ac"]
-            if "s" in ac_data and "l" in ac_data:
-                trading_pair = ac_data["s"]
-                leverage = int(ac_data["l"])
-                try:
-                    hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
-                    self.logger().info(f"Leverage updated for {hb_trading_pair}: {leverage}x")
-                except KeyError:
-                    pass
-
-        if "ai" in event_message:
-            ai_data = event_message["ai"]
-            if "j" in ai_data:
-                is_multi_assets_mode = ai_data["j"]
-                self.logger().info(f"Multi-assets mode updated: {is_multi_assets_mode}")
-
-    async def _iter_user_event_queue(self) -> AsyncIterable[Dict[str, any]]:
-        while True:
-            try:
-                yield await self._user_stream_tracker.user_stream.get()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().network(
-                    "Unknown error. Retrying after 1 seconds.",
-                    exc_info=True,
-                    app_warning_msg="Could not fetch user events from Binance. Check API key and network connection.",
-                )
-                await self._sleep(1.0)
-
-    async def start_network(self):
-        """
-        Start networking (orderbook, user stream)
-        Initializes the warm-up phase for orderbook building
-        """
-        # Reset the warm-up timer
-        self._ready = False
-        self._warm_up_start_time = time.time()
-
-        # Log the start of warm-up period
-        self.logger().info(f"Starting QTX Perpetual connector warm-up period ({CONSTANTS.ORDERBOOK_WARMUP_TIME} seconds)...")
-
-        # Start networks from parent class
-        await super().start_network()
-
-        # If trading is required, update the Binance connector
-        if self._trading_required and self._binance_connector is not None:
-            await self._binance_connector._update_balances()
-            await self._binance_connector._update_positions()
-            await self._binance_connector._update_trading_rules()
-
-    async def stop_network(self):
-        """
-        Stop networking
-        """
-        # Reset the ready flag
-        self._ready = False
-        self._warm_up_start_time = 0
-
-        # Stop the network from parent class
-        await super().stop_network()
+    # ---------------------------------------- Market Data Methods ----------------------------------------
 
     async def get_last_traded_price(self, trading_pair: str) -> float:
-        # Try to get price from QTX market data first
-        orderbook = self.get_order_book(trading_pair)
-        if orderbook and orderbook.last_trade_price:
-            return float(orderbook.last_trade_price)
-
-        # Last resort fallback - midpoint of best bid/ask
-        return (orderbook.get_price(True) + orderbook.get_price(False)) / 2
-
-    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         """
-        Create web assistants factory - delegate to Binance connector when available
+        Get the last traded price for a trading pair from QTX market data
         """
-        if self._trading_required and hasattr(self._binance_connector, "_create_web_assistants_factory"):
-            return self._binance_connector._create_web_assistants_factory()
-
-        # Fallback implementation
-        return WebAssistantsFactory(throttler=self._throttler, auth=self._auth)
-
-    def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> Dict[str, TradingRule]:
-        """
-        Format trading rules - delegate to Binance connector when available
-        """
-        if self._trading_required and hasattr(self._binance_connector, "_format_trading_rules"):
-            return self._binance_connector._format_trading_rules(exchange_info_dict)
-        return {}
-
-    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
-        """
-        Initialize trading pair symbols - delegate to Binance connector when available
-        """
-        if self._trading_required and hasattr(self._binance_connector, "_initialize_trading_pair_symbols_from_exchange_info"):
-            return self._binance_connector._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
-
-        # Implement basic fallback version
         try:
-            # Initialize maps if they don't exist
-            if not hasattr(self, "_exchange_symbol_map"):
-                self._exchange_symbol_map = {}
-            if not hasattr(self, "_symbol_to_exchange_symbol"):
-                self._symbol_to_exchange_symbol = {}
-            if not hasattr(self, "_exchange_info"):
-                self._exchange_info = {}
-
-            symbols_data = exchange_info.get("symbols", [])
-            for symbol_data in symbols_data:
-                symbol = symbol_data.get("symbol")
-                if symbol and symbol_data.get("status") == "TRADING":
-                    exchange_symbol = symbol
-                    self._exchange_symbol_map[exchange_symbol] = exchange_symbol
-                    self._symbol_to_exchange_symbol[exchange_symbol] = exchange_symbol
-                    # Store exchange info
-                    self._exchange_info[exchange_symbol] = symbol_data
+            orderbook = self.get_order_book(trading_pair)
+            if orderbook and orderbook.last_trade_price:
+                return float(orderbook.last_trade_price)
+            if orderbook:
+                return (orderbook.get_price(True) + orderbook.get_price(False)) / 2
+            raise ValueError(f"Order book not available for {trading_pair}")
         except Exception as e:
-            self.logger().error(f"Error initializing trading pairs from exchange info: {e}", exc_info=True)
+            self.logger().error(f"Error getting last traded price from QTX order book: {e}", exc_info=True)
+            raise
 
-    def _is_order_not_found_during_cancelation_error(self, exception) -> bool:
-        """
-        Check if the exception is due to order not found during cancelation
-        Delegate to Binance connector when available
-        """
-        if self._trading_required and hasattr(self._binance_connector, "_is_order_not_found_during_cancelation_error"):
-            return self._binance_connector._is_order_not_found_during_cancelation_error(exception)
-
-        # Fallback implementation
-        error_message = str(exception).lower()
-        return "order not found" in error_message or "unknown order" in error_message
-
-    def _is_order_not_found_during_status_update_error(self, exception) -> bool:
-        """
-        Check if the exception is due to order not found during status update
-        Delegate to Binance connector when available
-        """
-        if self._trading_required and hasattr(self._binance_connector, "_is_order_not_found_during_status_update_error"):
-            return self._binance_connector._is_order_not_found_during_status_update_error(exception)
-
-        # Fallback implementation
-        error_message = str(exception).lower()
-        return "order not found" in error_message or "unknown order" in error_message
-
-    def _is_request_exception_related_to_time_synchronizer(self, request_exception) -> bool:
-        """
-        Check if the exception is related to time synchronization
-        Delegate to Binance connector when available
-        """
-        if self._trading_required and hasattr(self._binance_connector, "_is_request_exception_related_to_time_synchronizer"):
-            return self._binance_connector._is_request_exception_related_to_time_synchronizer(request_exception)
-
-        # Fallback implementation
-        error_message = str(request_exception).lower()
-        return "timestamp" in error_message and "ahead" in error_message
+    # ---------------------------------------- Dummy for satisfying the base class ----------------------------------------
 
     async def _update_trading_fees(self):
         """
-        Update trading fees - delegate to Binance connector when available
+        Update fees information from the exchange
         """
-        if self._trading_required and hasattr(self._binance_connector, "_update_trading_fees"):
-            await self._binance_connector._update_trading_fees()
-            if hasattr(self._binance_connector, "_trading_fees"):
-                self._trading_fees = self._binance_connector._trading_fees
-        # No-op implementation if not trading
+        pass
+
+    # ---------------------------------------- Clock Management ----------------------------------------
+
+    def start(self, clock: Clock, timestamp: float):
+        """
+        Relay start command to the Binance connector
+        """
+        # This is called by Hummingbot automatically
+        super().start(clock, timestamp)
+
+        # Relay the timer calls to the Binance connector
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: start(clock, timestamp) failed")
+            return
+
+        try:
+            # Start the binance connector's own NetworkIterator logic
+            binance_instance.start(clock, timestamp)
+            self.logger().debug("Binance connector start(clock, timestamp) is called successfully")
+        except Exception as e:
+            self.logger().error(f"Error during delegation in start(clock, timestamp): {e}", exc_info=True)
+
+    def stop(self, clock: Clock):
+        """
+        Relay stop command to the Binance connector
+        """
+        super().stop(clock)
+
+        # Relay the timer calls to the Binance connector
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: stop(clock) failed")
+            return
+
+        try:
+            binance_instance.stop(clock)
+            self.logger().debug("Binance connector stop(clock) is called successfully")
+        except Exception as e:
+            self.logger().error(f"Error during delegation in stop(clock): {e}", exc_info=True)
+
+    def tick(self, timestamp: float):
+        """
+        Relay tick command to the Binance connector
+        """
+        super().tick(timestamp)
+
+        # Relay the timer calls to the Binance connector
+        binance_instance = self.binance_connector
+        if binance_instance is None:
+            self.logger().error("Binance connector not available: tick(timestamp) failed")
+            return
+
+        try:
+            # Also relay the clock tick to Binance
+            binance_instance.tick(timestamp)
+        except Exception as e:
+            self.logger().error(f"Error during delegation in tick(timestamp): {e}", exc_info=True)
