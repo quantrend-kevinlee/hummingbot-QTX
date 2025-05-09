@@ -210,12 +210,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         return self._trading_required
 
     @property
-    def status_dict(self) -> Dict[str, bool]:
-        status_dict = super().status_dict
-        self.logger().info(f"QTX Perpetual status check: {status_dict}")
-        return status_dict
-
-    @property
     def funding_fee_poll_interval(self) -> int:
         binance_instance = self.binance_connector
         if binance_instance is not None:
@@ -227,22 +221,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     async def _make_network_check_request(self):
         pass
 
-    async def start_network(self):
-        """
-        Start network components
-        """
-        await super().start_network()
-
-        binance_instance = self.binance_connector
-        if binance_instance is None:
-            self.logger().error("Binance connector not available: start_network() failed")
-            return
-        else:
-            await binance_instance.start_network()
-            self.logger().debug("Binance connector connector start_network() completed.")
-
-        self.logger().info("QTX Perpetual connector start_network() completed.")
-
     async def stop_network(self):
         """
         Stop networking
@@ -253,21 +231,15 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             for trading_pair in self._trading_pairs:
                 try:
                     qtx_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair)
+                    self.logger().info(f"QTX Perpetual stop_network() unsubscribing from {trading_pair} ({qtx_symbol})")
                     await self.udp_manager.unsubscribe_from_symbol(qtx_symbol)
+                    self.logger().info(f"QTX Perpetual stop_network() successfully unsubscribed from {trading_pair}")
                 except Exception as e:
                     self.logger().error(f"Error unsubscribing from {trading_pair}: {e}")
 
             await self.udp_manager.stop_listening()
 
-        binance_instance = self.binance_connector
-        if binance_instance is None:
-            self.logger().error("Binance connector not available: stop_network() failed")
-            return
-        else:
-            await binance_instance.stop_network()
-            self.logger().debug("Binance connector connector stop_network() completed.")
-
-        self.logger().info("QTX Perpetual connector stop_network() completed.")
+        self.logger().info("QTX Perpetual connector stop_network() FULLY completed.")
 
     # ---------------------------------------- Data Source Creation ----------------------------------------
 

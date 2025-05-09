@@ -486,10 +486,10 @@ class QtxPerpetualUDPManager:
         # Set socket back to non-blocking for receiving data
         self._udp_socket.setblocking(False)
 
-        # Log detailed subscription results
-        if subscription_attempts:
+        # Log detailed subscription results - only at DEBUG level
+        if subscription_attempts and self.logger().isEnabledFor(logging.DEBUG):
             success_rate = len(successful_pairs) / len(trading_pairs) * 100
-            self.logger().info(
+            self.logger().debug(
                 f"[{subscription_id}] Subscription summary: {len(successful_pairs)}/{len(trading_pairs)} successful ({success_rate:.1f}%)"
             )
 
@@ -820,9 +820,9 @@ class QtxPerpetualUDPManager:
                     data = recv_buffer[:bytes_read]
                     self._receive_count += 1
 
-                    # Log message count periodically - but only at important milestones
-                    if self._receive_count % 1000 == 0:
-                        self.logger().info(f"Received {self._receive_count} total UDP messages")
+                    # Log message count periodically - but only at debug level and at more significant milestones
+                    if self._receive_count % 10000 == 0 and self.logger().isEnabledFor(logging.DEBUG):
+                        self.logger().debug(f"Received {self._receive_count} total UDP messages")
 
                     if len(data) >= 40:  # Minimum header size
                         await self._process_message(data)
@@ -1116,7 +1116,7 @@ class QtxPerpetualUDPManager:
                     "update_id": int(time.time() * 1000),
                     "timestamp": time.time(),
                     "collection_duration": 0.0,
-                    "message_count": 0
+                    "message_count": 0,
                 }
 
         # Mark this trading pair as being collected
@@ -1244,7 +1244,7 @@ class QtxPerpetualUDPManager:
                     "update_id": update_id,
                     "timestamp": collection_end,
                     "collection_duration": collection_duration,
-                    "message_count": message_count
+                    "message_count": message_count,
                 }
 
                 self.logger().debug(
@@ -1285,7 +1285,7 @@ class QtxPerpetualUDPManager:
                 "update_id": int(time.time() * 1000),
                 "timestamp": time.time(),
                 "collection_duration": 0.0,
-                "message_count": 0
+                "message_count": 0,
             }
 
     # ---------------------------------------- End of Market Data Collection ----------------------------------------
@@ -1313,5 +1313,6 @@ class QtxPerpetualUDPManager:
             # Reset counters for next period
             for symbol in self._symbol_message_counts:
                 self._symbol_message_counts[symbol] = 0
+
 
 # ---------------------------------------- End of QtxPerpetualUDPManager ----------------------------------------
