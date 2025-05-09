@@ -131,7 +131,6 @@ class QtxExchange(ExchangePyBase):
         Returns a simulated UserStreamTrackerDataSource to satisfy application requirements
         when running a trading strategy with this connector.
         """
-        self.logger().info("Using simulated user stream data source.")
         return QTXAPIUserStreamDataSource()
 
     def trade_fee_schema(self) -> TradeFeeSchema:

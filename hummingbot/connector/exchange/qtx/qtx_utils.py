@@ -96,7 +96,6 @@ class QTXConfigMap(BaseConnectorConfigMap):
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX API key",
             "prompt_on_new": True,
-            "is_secure": True,
             "is_connect_key": True,
         },
     )
@@ -106,7 +105,6 @@ class QTXConfigMap(BaseConnectorConfigMap):
         json_schema_extra={
             "prompt": lambda cm: "Enter your QTX secret key",
             "prompt_on_new": True,
-            "is_secure": True,
             "is_connect_key": True,
         },
     )
