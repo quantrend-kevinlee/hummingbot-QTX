@@ -141,11 +141,11 @@ def main():
         "--max-messages", type=int, default=10, help="Maximum number of messages to capture (0 for unlimited)"
     )
     parser.add_argument("--buffer", type=int, default=UDP_SIZE, help="UDP receive buffer size")
-    parser.add_argument("--output", type=str, default="qtx_udp_feed.log", help="Path to output log file")
+    parser.add_argument("--output", type=str, default="./qtx_udp_feed.log", help="Path to output log file")
     parser.add_argument(
         "--symbols",
         type=str,
-        default="binance-futures:dashusdt",
+        default="binance-futures:ethusdt",
         help="Comma-separated list of symbols to subscribe to",
     )
     parser.add_argument(
