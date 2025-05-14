@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import asyncio
+import decimal
 from collections import defaultdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -39,8 +41,6 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------- Class Definition and Initialization ----------------------------------------
-
-
 class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     """
     QtxPerpetualDerivative connects to the QTX UDP market data source for real-time market data.
@@ -96,7 +96,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         self._init_binance_connector()
 
     # ---------------------------------------- Binance Connector Initialization ----------------------------------------
-
     def _init_binance_connector(self):
         """
         Initialize the Binance connector for order execution delegation
@@ -123,8 +122,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             )
             raise
 
-    # ---------------------------------------- Properties and Accessors ----------------------------------------ßß
-
+    # ---------------------------------------- Properties and Accessors ----------------------------------------
     @property
     def binance_connector(self) -> BinancePerpetualDerivative:
         """
@@ -216,8 +214,20 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return binance_instance.funding_fee_poll_interval
         return 600
 
-    # ---------------------------------------- Network and Lifecycle Management ----------------------------------------
+    @property
+    def account_positions(self) -> Dict[str, Position]:
+        """
+        Returns a dictionary of current active open positions.
 
+        In standalone mode, this returns QTX's own position tracking.
+        When running as part of a cross-exchange strategy with Binance,
+        this ensures each connector has its own position state.
+        """
+        # We no longer delegate to Binance's position tracking
+        # QTX maintains its own position state through the _user_stream_event_listener
+        return self._perpetual_trading.account_positions
+
+    # ---------------------------------------- Network and Lifecycle Management ----------------------------------------
     async def _make_network_check_request(self):
         pass
 
@@ -242,7 +252,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         self.logger().info("QTX Perpetual connector stop_network() FULLY completed.")
 
     # ---------------------------------------- Data Source Creation ----------------------------------------
-
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """
         Create the order book tracker data source using QTX
@@ -275,7 +284,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return binance_instance._create_web_assistants_factory()
 
     # ---------------------------------------- Trading Pair Management ----------------------------------------
-
     async def _initialize_trading_pair_symbol_map(self):
         """
         Initialize the trading pair symbol map by fetching data from the exchange
@@ -411,7 +419,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return []
 
     # ---------------------------------------- Order Placement and Management ----------------------------------------
-
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         """
         Delegate order cancellation to Binance connector
@@ -422,7 +429,13 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
         try:
             return await binance_instance._place_cancel(order_id=order_id, tracked_order=tracked_order)
-        except Exception as e:
+        except (IOError, Exception) as e:
+            if self._is_order_not_found_during_cancelation_error(e):
+                self.logger().debug(
+                    f"The order {order_id} does not exist on Binance Perpetuals. No cancelation needed."
+                )
+                await self._order_tracker.process_order_not_found(order_id)
+                return True
             self.logger().error(f"Error in _place_cancel: {e}", exc_info=True)
             raise
 
@@ -509,7 +522,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return "Timestamp for this request" in str(request_exception) and "reconfigure it" in str(request_exception)
 
     # ---------------------------------------- Status Polling and Updates ----------------------------------------
-
     async def _status_polling_loop_fetch_updates(self):
         """
         Fetches updates for orders, trades, balances and positions
@@ -569,7 +581,11 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _update_positions(self):
         """
-        Update positions - delegate to Binance directly
+        Update positions directly in QTX's connector.
+
+        While user stream events should keep positions updated in real-time,
+        this periodic update ensures positions are still synchronized in case
+        some events are missed or during initialization.
         """
         binance_instance = self.binance_connector
         if binance_instance is None:
@@ -577,16 +593,57 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return
 
         try:
-            await binance_instance._update_positions()
-            self._positions_cache = {}
+            # First, fetch position information from Binance's API
+            positions = await binance_instance._api_get(
+                path_url=BINANCE_CONSTANTS.POSITION_INFORMATION_URL, is_auth_required=True
+            )
 
-            for trading_pair in binance_instance._perpetual_trading._trading_pairs:
+            # Clear existing positions to avoid stale data
+            for trading_pair in self._trading_pairs:
                 for position_side in [PositionSide.LONG, PositionSide.SHORT]:
-                    position = binance_instance._perpetual_trading.get_position(trading_pair, position_side)
-                    if position is not None:
-                        if trading_pair not in self._positions_cache:
-                            self._positions_cache[trading_pair] = {}
-                        self._positions_cache[trading_pair][position_side] = position
+                    pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
+                    self._perpetual_trading.remove_position(pos_key)
+
+            # Process and update positions in QTX's own position tracker
+            for position in positions:
+                trading_pair = position.get("symbol")
+                try:
+                    hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(trading_pair)
+                except KeyError:
+                    # Skip positions for trading pairs not tracked by the connector
+                    continue
+
+                position_side = PositionSide[position.get("positionSide")]
+                if position_side is None:
+                    continue
+
+                try:
+                    entry_price = Decimal(position.get("entryPrice"))
+                    amount = Decimal(position.get("positionAmt"))
+                    unrealized_pnl = Decimal(position.get("unRealizedProfit"))
+                    leverage = Decimal(position.get("leverage"))
+
+                    # Get position key
+                    pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
+
+                    # Only add positions with non-zero amounts
+                    if amount != 0:
+                        _position = Position(
+                            trading_pair=hb_trading_pair,
+                            position_side=position_side,
+                            unrealized_pnl=unrealized_pnl,
+                            entry_price=entry_price,
+                            amount=amount,
+                            leverage=leverage,
+                        )
+                        self._perpetual_trading.set_position(pos_key, _position)
+                except (ValueError, TypeError, decimal.InvalidOperation) as e:
+                    self.logger().error(f"Error parsing position data: {e}. Position data: {position}", exc_info=True)
+                    continue
+
+                else:
+                    # If position amount is 0, remove the position
+                    self._perpetual_trading.remove_position(pos_key)
         except Exception as e:
             self.logger().error(f"Error in _update_positions: {e}", exc_info=True)
 
@@ -633,12 +690,147 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return []
 
     # ---------------------------------------- User Stream Management ----------------------------------------
-
     async def _user_stream_event_listener(self):
         """
-        No-op because we delegate all user stream events to the Binance sub-connector.
+        Process user stream events received from the Binance connector.
+
+        This handler processes the same events that were processed by Binance's connector,
+        ensuring that QTX's own order tracker is properly updated. This is especially
+        important for position tracking when orders are filled.
         """
-        pass
+
+        while True:
+            try:
+                # Get data from the user stream - handle data format from Binance
+                # Since we're delegating to Binance's user stream, we need to adapt to its format
+                data = await self._user_stream_tracker.user_stream.get()
+
+                # Binance sends the event message directly without a channel component
+                event_message = data
+
+                # Process the same message types as Binance does
+                event_type = event_message.get("e")
+
+                # Process order updates
+                if event_type == "ORDER_TRADE_UPDATE":
+                    order_data = event_message.get("o", {})
+                    client_order_id = order_data.get("c", "")
+
+                    # Find the order in our order tracker
+                    tracked_order = self._order_tracker.fetch_order(client_order_id=client_order_id)
+                    if tracked_order is not None:
+                        # Process the order update in QTX's order tracker
+                        exchange_order_id = str(order_data.get("i", ""))
+                        trade_id = str(order_data.get("t", ""))
+                        trading_pair = await self.trading_pair_associated_to_exchange_symbol(order_data.get("s", ""))
+
+                        # Process different order statuses
+                        order_status = order_data.get("X", "")
+                        fill_price = Decimal(order_data.get("L", "0"))
+                        fill_amount = Decimal(order_data.get("l", "0"))
+                        fee_asset = order_data.get("N", "")
+                        fee_amount = Decimal(order_data.get("n", "0"))
+
+                        # Process filled orders
+                        if fill_amount > 0 and fill_price > 0:
+                            fee = {fee_asset: fee_amount} if fee_asset else {}
+                            # Create proper TradeUpdate object
+                            trade_update = TradeUpdate(
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                                trade_id=trade_id,
+                                trading_pair=trading_pair,
+                                fee=fee,
+                                fill_price=fill_price,
+                                fill_base_amount=fill_amount,
+                                fill_quote_amount=fill_price * fill_amount,
+                                fill_timestamp=self.current_timestamp,
+                            )
+                            self._order_tracker.process_trade_update(trade_update)
+
+                        # Process order status updates
+                        if order_status in ["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"]:
+                            # Create proper OrderUpdate object instead of passing individual parameters
+                            order_update = OrderUpdate(
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                                trading_pair=trading_pair,
+                                update_timestamp=self.current_timestamp,
+                                new_state=self._binance_order_status_to_oms_order_status(order_status),
+                            )
+                            self._order_tracker.process_order_update(order_update)
+
+                # Process account position updates
+                elif event_type == "ACCOUNT_UPDATE":
+                    account_data = event_message.get("a", {})
+                    positions_data = account_data.get("P", [])
+
+                    # Process position updates
+                    for position in positions_data:
+                        symbol = position.get("s", "")
+                        try:
+                            trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol)
+                        except KeyError:
+                            # Skip positions for trading pairs not tracked by this connector
+                            continue
+
+                        position_side = (
+                            PositionSide.LONG
+                            if position.get("ps", "") == "LONG"
+                            else PositionSide.SHORT if position.get("ps", "") == "SHORT" else None
+                        )
+                        if position_side is None:
+                            continue
+
+                        try:
+                            entry_price = Decimal(position.get("ep", "0"))
+                            amount = Decimal(position.get("pa", "0"))
+                            unrealized_pnl = Decimal(position.get("up", "0"))
+                            leverage = Decimal(position.get("ma", "1"))
+                        except (ValueError, TypeError, decimal.InvalidOperation) as e:
+                            self.logger().error(
+                                f"Error parsing position data: {e}. Position data: {position}", exc_info=True
+                            )
+                            continue
+
+                        # Get position key
+                        pos_key = self._perpetual_trading.position_key(
+                            trading_pair, position_side, self._perpetual_trading.position_mode
+                        )
+
+                        # If the position amount is non-zero, update or add the position
+                        if amount != 0:
+                            _position = Position(
+                                trading_pair=trading_pair,
+                                position_side=position_side,
+                                unrealized_pnl=unrealized_pnl,
+                                entry_price=entry_price,
+                                amount=amount,
+                                leverage=leverage,
+                            )
+                            self._perpetual_trading.set_position(pos_key, _position)
+                        else:
+                            # If position amount is 0, remove the position
+                            self._perpetual_trading.remove_position(pos_key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Unexpected error in user stream listener loop: {e}", exc_info=True)
+
+    def _binance_order_status_to_oms_order_status(self, status: str):
+        """Convert Binance order status to our internal OrderState enum"""
+        from hummingbot.core.data_type.in_flight_order import OrderState
+
+        binance_to_oms_status = {
+            "NEW": OrderState.OPEN,
+            "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
+            "FILLED": OrderState.FILLED,
+            "CANCELED": OrderState.CANCELED,
+            "PENDING_CANCEL": OrderState.PENDING_CANCEL,
+            "REJECTED": OrderState.FAILED,
+            "EXPIRED": OrderState.FAILED,
+        }
+        return binance_to_oms_status.get(status, OrderState.OPEN)
 
     def _is_user_stream_initialized(self) -> bool:
         """
@@ -655,7 +847,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         return False
 
     # ---------------------------------------- Trading Configuration ----------------------------------------
-
     def supported_order_types(self) -> List[OrderType]:
         """
         Returns order types supported by the connector
@@ -705,7 +896,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             return False, f"Binance operation failed: {str(e)}"
 
     # ---------------------------------------- Fees and Collateral ----------------------------------------
-
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
         """
         Delegate last fee payment fetch to Binance connector
@@ -793,7 +983,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     # ---------------------------------------- Market Data Methods ----------------------------------------
-
     async def get_last_traded_price(self, trading_pair: str) -> float:
         """
         Get the last traded price for a trading pair from QTX market data
@@ -810,7 +999,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             raise
 
     # ---------------------------------------- Dummy for satisfying the base class ----------------------------------------
-
     async def _update_trading_fees(self):
         """
         Update fees information from the exchange
@@ -818,7 +1006,6 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         pass
 
     # ---------------------------------------- Clock Management ----------------------------------------
-
     def start(self, clock: Clock, timestamp: float):
         """
         Relay start command to the Binance connector
