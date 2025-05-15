@@ -1,4 +1,5 @@
 import logging
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set
 
@@ -22,6 +23,7 @@ class ScriptConfigBase(BaseModel):
     """
     Base configuration class for script strategies. Subclasses can add their own configuration parameters.
     """
+
     pass
 
 
@@ -32,6 +34,8 @@ class ScriptStrategyBase(StrategyPyBase):
 
     # This class member defines connectors and their trading pairs needed for the strategy operation,
     markets: Dict[str, Set[str]]
+
+    CONNECTOR_NOT_READY_LOG_COOLDOWN_SEC: float = 1.0  # Seconds
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -57,6 +61,7 @@ class ScriptStrategyBase(StrategyPyBase):
         self.ready_to_trade: bool = False
         self.add_markets(list(connectors.values()))
         self.config = config
+        self._last_connector_not_ready_warning_ts: Dict[str, float] = {}
 
     def tick(self, timestamp: float):
         """
@@ -68,8 +73,12 @@ class ScriptStrategyBase(StrategyPyBase):
         if not self.ready_to_trade:
             self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
             if not self.ready_to_trade:
+                current_ts = time.time()
                 for con in [c for c in self.connectors.values() if not c.ready]:
-                    self.logger().warning(f"{con.name} is not ready. Please wait...")
+                    last_logged_ts = self._last_connector_not_ready_warning_ts.get(con.name, 0.0)
+                    if current_ts - last_logged_ts > self.CONNECTOR_NOT_READY_LOG_COOLDOWN_SEC:
+                        self.logger().warning(f"{con.name} is not ready. Please wait...")
+                        self._last_connector_not_ready_warning_ts[con.name] = current_ts
                 return
         else:
             self.on_tick()
@@ -84,13 +93,15 @@ class ScriptStrategyBase(StrategyPyBase):
     async def on_stop(self):
         pass
 
-    def buy(self,
-            connector_name: str,
-            trading_pair: str,
-            amount: Decimal,
-            order_type: OrderType,
-            price=s_decimal_nan,
-            position_action=PositionAction.OPEN) -> str:
+    def buy(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        amount: Decimal,
+        order_type: OrderType,
+        price=s_decimal_nan,
+        position_action=PositionAction.OPEN,
+    ) -> str:
         """
         A wrapper function to buy_with_specific_market.
 
@@ -107,13 +118,15 @@ class ScriptStrategyBase(StrategyPyBase):
         self.logger().debug(f"Creating {trading_pair} buy order: price: {price} amount: {amount}.")
         return self.buy_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)
 
-    def sell(self,
-             connector_name: str,
-             trading_pair: str,
-             amount: Decimal,
-             order_type: OrderType,
-             price=s_decimal_nan,
-             position_action=PositionAction.OPEN) -> str:
+    def sell(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        amount: Decimal,
+        order_type: OrderType,
+        price=s_decimal_nan,
+        position_action=PositionAction.OPEN,
+    ) -> str:
         """
         A wrapper function to sell_with_specific_market.
 
@@ -130,10 +143,7 @@ class ScriptStrategyBase(StrategyPyBase):
         self.logger().debug(f"Creating {trading_pair} sell order: price: {price} amount: {amount}.")
         return self.sell_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)
 
-    def cancel(self,
-               connector_name: str,
-               trading_pair: str,
-               order_id: str):
+    def cancel(self, connector_name: str, trading_pair: str, order_id: str):
         """
         A wrapper function to cancel_order.
 
@@ -186,11 +196,15 @@ class ScriptStrategyBase(StrategyPyBase):
         data: List[Any] = []
         for connector_name, connector in self.connectors.items():
             for asset in self.get_assets(connector_name):
-                data.append([connector_name,
-                             asset,
-                             float(connector.get_balance(asset)),
-                             float(connector.get_available_balance(asset))])
-        df = pd.DataFrame(data=data, columns=columns).replace(np.nan, '', regex=True)
+                data.append(
+                    [
+                        connector_name,
+                        asset,
+                        float(connector.get_balance(asset)),
+                        float(connector.get_available_balance(asset)),
+                    ]
+                )
+        df = pd.DataFrame(data=data, columns=columns).replace(np.nan, "", regex=True)
         df.sort_values(by=["Exchange", "Asset"], inplace=True)
         return df
 
@@ -202,15 +216,17 @@ class ScriptStrategyBase(StrategyPyBase):
         data = []
         for connector_name, connector in self.connectors.items():
             for order in self.get_active_orders(connector_name):
-                age_txt = "n/a" if order.age() <= 0. else pd.Timestamp(order.age(), unit='s').strftime('%H:%M:%S')
-                data.append([
-                    connector_name,
-                    order.trading_pair,
-                    "buy" if order.is_buy else "sell",
-                    float(order.price),
-                    float(order.quantity),
-                    age_txt
-                ])
+                age_txt = "n/a" if order.age() <= 0.0 else pd.Timestamp(order.age(), unit="s").strftime("%H:%M:%S")
+                data.append(
+                    [
+                        connector_name,
+                        order.trading_pair,
+                        "buy" if order.is_buy else "sell",
+                        float(order.price),
+                        float(order.quantity),
+                        age_txt,
+                    ]
+                )
         if not data:
             raise ValueError
         df = pd.DataFrame(data=data, columns=columns)
@@ -242,9 +258,7 @@ class ScriptStrategyBase(StrategyPyBase):
             lines.extend(["", "*** WARNINGS ***"] + warning_lines)
         return "\n".join(lines)
 
-    def _market_trading_pair_tuple(self,
-                                   connector_name: str,
-                                   trading_pair: str) -> MarketTradingPairTuple:
+    def _market_trading_pair_tuple(self, connector_name: str, trading_pair: str) -> MarketTradingPairTuple:
         """
         Creates and returns a new MarketTradingPairTuple
 

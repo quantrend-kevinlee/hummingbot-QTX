@@ -43,6 +43,14 @@ class QtxPerpetualConfigMap(BaseConnectorConfigMap):
             "is_connect_key": True,
         },
     )
+    qtx_place_order_shared_memory_name: str = Field(
+        default="/place_order_kevinlee",
+        json_schema_extra={
+            "prompt": lambda cm: "Enter the QTX shared memory segment name:",
+            "prompt_on_new": True,
+            "is_connect_key": True,
+        },
+    )
     binance_api_key: SecretStr = Field(
         default="",
         json_schema_extra={

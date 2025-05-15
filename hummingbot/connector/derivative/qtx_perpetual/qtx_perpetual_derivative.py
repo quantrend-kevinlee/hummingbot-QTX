@@ -2,6 +2,7 @@
 
 import asyncio
 import decimal
+import time
 from collections import defaultdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -20,6 +21,7 @@ from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_api_order_book_
     QtxPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_auth import QtxPerpetualBinanceAuth
+from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_shm_manager import QtxPerpetualSharedMemoryManager
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_udp_manager import QtxPerpetualUDPManager
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_user_stream_data_source import (
     QtxPerpetualUserStreamDataSource,
@@ -31,8 +33,10 @@ from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import TradeFeeBase
+from hummingbot.core.data_type.trade_fee import TradeFeeBase, TokenAmount
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.event.event_forwarder import EventForwarder
+from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -57,8 +61,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         client_config_map: "ClientConfigAdapter",
         qtx_perpetual_host: str = CONSTANTS.DEFAULT_UDP_HOST,
         qtx_perpetual_port: int = CONSTANTS.DEFAULT_UDP_PORT,
-        binance_api_key: str = None,  # Binance API key
-        binance_api_secret: str = None,  # Binance API secret
+        binance_api_key: str = None,  # Binance API key (also used for QTX shared memory)
+        binance_api_secret: str = None,  # Binance API secret (also used for QTX shared memory)
+        qtx_place_order_shared_memory_name: str = None,  # Shared memory segment name for order execution
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
@@ -67,11 +72,14 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         self._qtx_perpetual_host = qtx_perpetual_host
         self._qtx_perpetual_port = qtx_perpetual_port
 
-        # Hold off on creating the UDP manager until it's actually needed
-        # This will be created on-demand in the property getter
-        self._udp_manager = None
+        # QTX shared memory settings for order execution
+        self._qtx_shared_memory_name = qtx_place_order_shared_memory_name
 
-        # Binance API credentials for trading
+        # Hold off on creating the managers until they're actually needed
+        self._udp_manager = None
+        self._shm_manager = None
+
+        # API credentials for trading (used by both Binance API and QTX shared memory)
         self._binance_api_key = binance_api_key
         self._binance_api_secret = binance_api_secret
         self._domain = domain
@@ -84,6 +92,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         self._positions_cache: Dict[str, Dict[PositionSide, Position]] = defaultdict(dict)
         self._funding_info = {}
 
+        # For tracking shared memory orders
+        self._client_order_id_to_exchange_id = {}
+
         # Initialize trading pair symbols map (bidict for bidirectional mapping)
         self._trading_pair_symbol_map = bidict()
 
@@ -93,7 +104,85 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         # Initialize the base class after binance connector initialization
         super().__init__(client_config_map)
 
+        # Set up event forwarders to relay events from Binance to QTX
+        self._event_forwarders: List[Tuple[MarketEvent, EventForwarder]] = []
+
+        # Always initialize Binance connector for market data and other functions
         self._init_binance_connector()
+
+        # Configure event forwarding after Binance connector is initialized
+        self._configure_event_forwarding()
+
+    def _configure_event_forwarding(self):
+        """Configure event forwarding from Binance connector to QTX"""
+        if self.binance_connector is None:
+            self.logger().warning("Cannot configure event forwarding - Binance connector not available")
+            return
+
+        # Import event types we need to forward
+        from hummingbot.core.event.events import (
+            OrderFilledEvent,
+            BuyOrderCompletedEvent,
+            SellOrderCompletedEvent,
+            OrderCancelledEvent,
+            MarketOrderFailureEvent,
+            BuyOrderCreatedEvent,
+            SellOrderCreatedEvent,
+            PositionUpdateEvent,
+        )
+
+        # Define event forwarder function
+        def create_forwarder(market_event_type):
+            def forward_event(event):
+                # Change the event source from Binance to QTX
+                if hasattr(event, "_event_source"):
+                    event._event_source = self.name
+                # Re-emit the event from this connector
+                self.trigger_event(market_event_type, event)
+                self.logger().debug(f"Forwarded {market_event_type} from Binance to QTX: {event}")
+
+            return forward_event
+
+        # Event types to forward
+        event_mappings = [
+            (MarketEvent.OrderFilled, OrderFilledEvent),
+            (MarketEvent.BuyOrderCompleted, BuyOrderCompletedEvent),
+            (MarketEvent.SellOrderCompleted, SellOrderCompletedEvent),
+            (MarketEvent.OrderCancelled, OrderCancelledEvent),
+            (MarketEvent.OrderFailure, MarketOrderFailureEvent),
+            (MarketEvent.BuyOrderCreated, BuyOrderCreatedEvent),
+            (MarketEvent.SellOrderCreated, SellOrderCreatedEvent),
+            (MarketEvent.PositionUpdate, PositionUpdateEvent),
+        ]
+
+        # Create and register forwarders
+        self._event_forwarders = []
+        for event_type, event_class in event_mappings:
+            forwarder = create_forwarder(event_type)
+            self.binance_connector.add_listener(event_type, forwarder)
+            self._event_forwarders.append((event_type, forwarder))
+
+        self.logger().info(f"Configured event forwarding for {len(self._event_forwarders)} event types")
+
+    def _stop_event_forwarding(self):
+        """Stop event forwarding from Binance connector"""
+        if self.binance_connector is None or not self._event_forwarders:
+            return
+
+        for event_type, forwarder in self._event_forwarders:
+            try:
+                self.binance_connector.remove_listener(event_type, forwarder)
+            except Exception as e:
+                self.logger().warning(f"Failed to remove event forwarder for {event_type}: {e}")
+
+        self._event_forwarders.clear()
+        self.logger().info("Stopped event forwarding from Binance connector")
+
+        # Log a warning if trading is required but no shared memory name is provided
+        if self._trading_required and not self._qtx_shared_memory_name:
+            self.logger().error(
+                "No shared memory name provided. QTX Perpetual order placement via shared memory will be unavailable."
+            )
 
     # ---------------------------------------- Binance Connector Initialization ----------------------------------------
     def _init_binance_connector(self):
@@ -145,6 +234,42 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         if self._udp_manager is None:
             self._udp_manager = QtxPerpetualUDPManager(host=self._qtx_perpetual_host, port=self._qtx_perpetual_port)
         return self._udp_manager
+
+    @property
+    def shm_manager(self):
+        """
+        Returns the shared memory manager instance.
+        Instance is created on first access, but connection is handled
+        automatically in the manager's methods.
+
+        :return: The shared memory manager instance, or None if no shared memory name is provided
+        """
+        try:
+            if self._shm_manager is None and self._qtx_shared_memory_name:
+                # Log warning if API keys are not available
+                if not self._binance_api_key or not self._binance_api_secret:
+                    self.logger().warning(
+                        "Creating shared memory manager without API credentials. "
+                        "Order placement will not work until credentials are provided."
+                    )
+
+                # Create instance if it doesn't exist yet
+                self._shm_manager = QtxPerpetualSharedMemoryManager.get_instance(
+                    api_key=self._binance_api_key,
+                    api_secret=self._binance_api_secret,
+                    shm_name=self._qtx_shared_memory_name,
+                )
+
+                self.logger().info(f"Shared memory manager initialized with segment '{self._qtx_shared_memory_name}'")
+            elif self._shm_manager is None and not self._qtx_shared_memory_name:
+                # Log debug message to clarify why the manager is None
+                self.logger().debug("Shared memory manager not created: No shared memory name provided")
+        except Exception as e:
+            self.logger().error(f"Error creating shared memory manager: {e}", exc_info=True)
+            # Reset the manager to None so it can be retried later
+            self._shm_manager = None
+
+        return self._shm_manager
 
     @property
     def name(self) -> str:
@@ -225,7 +350,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         # We no longer delegate to Binance's position tracking
         # QTX maintains its own position state through the _user_stream_event_listener
-        return self._perpetual_trading.account_positions
+        positions = self._perpetual_trading.account_positions
+        self.logger().debug(f"QTX account_positions accessed - Count: {len(positions)}, Keys: {list(positions.keys())}")
+        return positions
 
     # ---------------------------------------- Network and Lifecycle Management ----------------------------------------
     async def _make_network_check_request(self):
@@ -233,10 +360,14 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def stop_network(self):
         """
-        Stop networking
+        Stop networking for UDP and shared memory connections
         """
         await super().stop_network()
 
+        # Stop event forwarders
+        self._stop_event_forwarding()
+
+        # Stop UDP manager
         if self._udp_manager is not None:
             for trading_pair in self._trading_pairs:
                 try:
@@ -248,6 +379,15 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     self.logger().error(f"Error unsubscribing from {trading_pair}: {e}")
 
             await self.udp_manager.stop_listening()
+
+        # Stop shared memory manager
+        if self._shm_manager is not None:
+            try:
+                # Just call disconnect - the manager can handle its own state
+                await self._shm_manager.disconnect()
+                self.logger().info("QTX Perpetual shared memory manager disconnected")
+            except Exception as e:
+                self.logger().error(f"Error disconnecting shared memory manager: {e}")
 
         self.logger().info("QTX Perpetual connector stop_network() FULLY completed.")
 
@@ -421,22 +561,113 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     # ---------------------------------------- Order Placement and Management ----------------------------------------
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         """
-        Delegate order cancellation to Binance connector
+        Cancel an order using QTX shared memory
         """
-        binance_instance = self.binance_connector
-        if binance_instance is None:
-            raise ValueError("Binance connector not available: _place_cancel failed")
-
         try:
-            return await binance_instance._place_cancel(order_id=order_id, tracked_order=tracked_order)
-        except (IOError, Exception) as e:
-            if self._is_order_not_found_during_cancelation_error(e):
-                self.logger().debug(
-                    f"The order {order_id} does not exist on Binance Perpetuals. No cancelation needed."
+            # Get shared memory manager (connection happens automatically in its methods)
+            shm_manager = self.shm_manager
+            if shm_manager is None:
+                error_msg = "Shared memory manager is not available"
+                self.logger().error(f"Cannot cancel order {order_id}: {error_msg}")
+                raise ValueError(error_msg)
+
+            # Verify API credentials are available
+            if not self._binance_api_key or not self._binance_api_secret:
+                error_msg = "API credentials are required for order cancellation"
+                self.logger().error(f"Cannot cancel order {order_id}: {error_msg}")
+                raise ValueError(error_msg)
+
+            # Get the trading pair symbol in exchange format
+            try:
+                symbol = await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)
+            except Exception as e:
+                error_msg = f"Invalid trading pair format: {tracked_order.trading_pair}"
+                self.logger().error(f"Error converting trading pair for cancellation: {e}", exc_info=True)
+                raise ValueError(error_msg)
+
+            self.logger().info(f"Cancelling order via QTX shared memory: {order_id}")
+
+            # Attempt to cancel via shared memory with explicit error handling
+            try:
+                success, result = await shm_manager.cancel_order(client_order_id=order_id, symbol=symbol)
+            except Exception as e:
+                error_msg = f"Shared memory order cancellation operation failed: {str(e)}"
+                self.logger().error(f"Error during cancel_order operation: {e}", exc_info=True)
+                raise IOError(error_msg)
+
+            if success:
+                # Extract order status and update the order tracker
+                status = result.get("status", "CANCELED")
+                transaction_time = result.get("transaction_time", self.current_timestamp)
+
+                # Get exchange order ID from our mapping or from the response
+                exchange_order_id = self._client_order_id_to_exchange_id.get(
+                    order_id, result.get("exchange_order_id", tracked_order.exchange_order_id)
                 )
-                await self._order_tracker.process_order_not_found(order_id)
+
+                # Create and process the order update
+                order_state = self._binance_order_status_to_oms_order_status(status)
+                order_update = OrderUpdate(
+                    client_order_id=order_id,
+                    exchange_order_id=exchange_order_id,
+                    trading_pair=tracked_order.trading_pair,
+                    update_timestamp=transaction_time,
+                    new_state=order_state,
+                )
+
+                self._order_tracker.process_order_update(order_update)
+
+                # Sync cancellation state with Binance connector if available
+                if self.binance_connector is not None:
+                    try:
+                        # Create an equivalent order update for Binance's order tracker
+                        binance_order_update = OrderUpdate(
+                            client_order_id=order_id,
+                            exchange_order_id=exchange_order_id,
+                            trading_pair=tracked_order.trading_pair,
+                            update_timestamp=transaction_time,
+                            new_state=order_state,
+                        )
+
+                        # Use Binance's order tracker to process the update
+                        self.binance_connector._order_tracker.process_order_update(binance_order_update)
+
+                        self.logger().debug(f"Synchronized cancel for order {order_id} with Binance connector")
+                    except Exception as e:
+                        self.logger().warning(
+                            f"Failed to synchronize cancel for order {order_id} with Binance connector: {e}"
+                        )
+
+                self.logger().info(f"Order cancelled successfully via QTX shared memory: {order_id}")
                 return True
-            self.logger().error(f"Error in _place_cancel: {e}", exc_info=True)
+            else:
+                # Check if this is a "not found" error, which we treat as success
+                error_msg = result.get("error", "")
+                if "not exist" in error_msg.lower() or "not found" in error_msg.lower():
+                    self.logger().debug(f"The order {order_id} does not exist on QTX. Treating as already cancelled.")
+                    await self._order_tracker.process_order_not_found(order_id)
+
+                    # Sync "not found" state with Binance connector if available
+                    if self.binance_connector is not None:
+                        try:
+                            await self.binance_connector._order_tracker.process_order_not_found(order_id)
+                            self.logger().debug(
+                                f"Synchronized 'not found' status for order {order_id} with Binance connector"
+                            )
+                        except Exception as e:
+                            self.logger().warning(
+                                f"Failed to sync 'not found' status for order {order_id} with Binance connector: {e}"
+                            )
+
+                    return True
+
+                # For other errors, raise an exception
+                self.logger().error(f"Failed to cancel order {order_id} via QTX shared memory: {result}")
+                raise IOError(f"QTX shared memory order cancellation failed: {error_msg}")
+
+        except Exception as e:
+            self.logger().error(f"Error cancelling order via QTX shared memory: {e}", exc_info=True)
+            # Do not fall back, let the error propagate
             raise
 
     async def _place_order(
@@ -451,31 +682,238 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         **kwargs,
     ) -> Tuple[str, float]:
         """
-        Delegate order placement to Binance connector
+        Place an order using QTX shared memory
         """
-        binance_instance = self.binance_connector
-        if binance_instance is None:
-            raise ValueError("Binance connector not available: _place_order failed")
-
         try:
-            return await binance_instance._place_order(
-                order_id=order_id,
-                trading_pair=trading_pair,
-                amount=amount,
-                trade_type=trade_type,
-                order_type=order_type,
-                price=price,
-                position_action=position_action,
-                **kwargs,
+            # Get shared memory manager (connection happens automatically in its methods)
+            shm_manager = self.shm_manager
+            if shm_manager is None:
+                error_msg = "Shared memory manager is not available"
+                self.logger().error(f"Cannot place order {order_id}: {error_msg}")
+                raise ValueError(error_msg)
+
+            # Verify API credentials are available
+            if not self._binance_api_key or not self._binance_api_secret:
+                error_msg = "API credentials are required for order placement"
+                self.logger().error(f"Cannot place order {order_id}: {error_msg}")
+                raise ValueError(error_msg)
+
+            # Convert parameters to QTX format
+            try:
+                qtx_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+            except Exception as e:
+                error_msg = f"Invalid trading pair format: {trading_pair}"
+                self.logger().error(f"Error converting trading pair: {e}", exc_info=True)
+                raise ValueError(error_msg)
+
+            # Import constants from the shm_manager module
+            from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_shm_manager import (
+                QTX_ORDER_TYPE_GTC,
+                QTX_ORDER_TYPE_IOC,
+                QTX_ORDER_TYPE_POST_ONLY,
+                QTX_POS_SIDE_BOTH,
+                QTX_POS_SIDE_LONG,
+                QTX_POS_SIDE_SHORT,
+                QTX_PRICE_MATCH_NONE,
+                QTX_SIDE_BUY,
+                QTX_SIDE_SELL,
             )
+
+            # Set side (1 for buy, -1 for sell)
+            side = QTX_SIDE_BUY if trade_type is TradeType.BUY else QTX_SIDE_SELL
+
+            # Set position side
+            if position_action is PositionAction.OPEN:
+                if trade_type is TradeType.BUY:
+                    pos_side = QTX_POS_SIDE_LONG
+                else:
+                    pos_side = QTX_POS_SIDE_SHORT
+            elif position_action is PositionAction.CLOSE:
+                if trade_type is TradeType.BUY:
+                    pos_side = QTX_POS_SIDE_SHORT  # Buy to close a short
+                else:
+                    pos_side = QTX_POS_SIDE_LONG  # Sell to close a long
+            else:
+                pos_side = QTX_POS_SIDE_BOTH
+
+            # Map Hummingbot order type to QTX order type
+            if order_type is OrderType.LIMIT:
+                qtx_order_type = QTX_ORDER_TYPE_GTC
+            elif order_type is OrderType.LIMIT_MAKER:
+                qtx_order_type = QTX_ORDER_TYPE_POST_ONLY
+            else:
+                qtx_order_type = QTX_ORDER_TYPE_IOC
+
+            self.logger().info(
+                f"Placing order via QTX shared memory: {order_id}, {trading_pair}, {amount}, {side}, {pos_side}, {price}"
+            )
+
+            # Place the order via shared memory with additional error handling
+            try:
+                # The shared memory manager will handle NaN/None price validation
+                success, order_result = await shm_manager.place_order(
+                    client_order_id=order_id,
+                    symbol=qtx_symbol,
+                    side=side,
+                    position_side=pos_side,
+                    order_type=qtx_order_type,
+                    price=price,
+                    size=amount,
+                    price_match=QTX_PRICE_MATCH_NONE,
+                )
+            except Exception as e:
+                error_msg = f"Shared memory order placement operation failed: {str(e)}"
+                self.logger().error(f"Error during place_order operation: {e}", exc_info=True)
+                raise IOError(error_msg)
+
+            if not success:
+                error_msg = order_result.get("error", "Unknown error")
+                self.logger().error(f"Error placing order via QTX shared memory: {error_msg}")
+                raise IOError(f"QTX shared memory order placement failed: {error_msg}")
+
+            # Extract the exchange order ID
+            exchange_order_id = order_result.get("exchange_order_id", None)
+            if not exchange_order_id:
+                # Generate a temporary ID if not provided by the exchange
+                exchange_order_id = f"qtx_{int(time.time() * 1000)}_{order_id}"
+
+            # Store mapping for future reference
+            self._client_order_id_to_exchange_id[order_id] = exchange_order_id
+
+            # Get timestamp from response or use current time
+            transaction_time = order_result.get("transaction_time", self.current_timestamp)
+
+            # Get order status and create an order update to immediately reflect the state
+            status = order_result.get("status", "NEW")
+
+            # Process the order update in our tracker
+            order_state = self._binance_order_status_to_oms_order_status(status)
+            order_update = OrderUpdate(
+                client_order_id=order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=trading_pair,
+                update_timestamp=transaction_time,
+                new_state=order_state,
+            )
+
+            self._order_tracker.process_order_update(order_update)
+
+            # Sync order state with Binance connector if available
+            if self.binance_connector is not None:
+                try:
+                    # Create an equivalent order update for Binance's order tracker
+                    binance_order_update = OrderUpdate(
+                        client_order_id=order_id,
+                        exchange_order_id=exchange_order_id,
+                        trading_pair=trading_pair,
+                        update_timestamp=transaction_time,
+                        new_state=order_state,
+                    )
+
+                    # Use Binance's order tracker to process the update
+                    self.binance_connector._order_tracker.process_order_update(binance_order_update)
+
+                    # Store the mapping in Binance's order tracker
+                    # This ensures Binance connector can find the order in future operations
+                    # Create an InFlightOrder object to pass to start_tracking_order
+                    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+
+                    binance_order = InFlightOrder(
+                        client_order_id=order_id,
+                        exchange_order_id=exchange_order_id,
+                        trading_pair=trading_pair,
+                        order_type=order_type,
+                        trade_type=trade_type,
+                        price=price,
+                        amount=amount,
+                        creation_timestamp=transaction_time,
+                        initial_state=order_state,
+                    )
+                    self.binance_connector._order_tracker.start_tracking_order(binance_order)
+
+                    self.logger().debug(f"Synchronized order {order_id} state with Binance connector")
+                except Exception as e:
+                    self.logger().warning(f"Failed to synchronize order {order_id} with Binance connector: {e}")
+
+            self.logger().info(
+                f"Order placed via QTX shared memory: {order_id} -> {exchange_order_id}, status: {status}"
+            )
+
+            # Check if the order was immediately filled and create a TradeUpdate if needed
+            if status in ["FILLED", "PARTIALLY_FILLED"]:
+                # Extract fill information from the response
+                fill_price = order_result.get("price", price)
+                if fill_price and isinstance(fill_price, str):
+                    fill_price = Decimal(fill_price)
+
+                # Use executed_qty if available, otherwise fall back to quantity or order amount
+                fill_quantity = order_result.get("executed_qty", order_result.get("quantity", amount))
+                if fill_quantity and isinstance(fill_quantity, str):
+                    fill_quantity = Decimal(fill_quantity)
+
+                # Create TradeUpdate for the fill
+                if fill_price and fill_quantity:
+                    trade_id = order_result.get("trade_id", exchange_order_id)
+                    # Extract quote asset from trading pair for fee calculation
+                    base_asset, quote_asset = trading_pair.split("-")
+                    fee_asset = order_result.get("fee_asset", quote_asset)
+                    fee_amount = order_result.get("fee_amount", Decimal("0"))
+                    if fee_amount and isinstance(fee_amount, str):
+                        fee_amount = Decimal(fee_amount)
+
+                    # Create flat fees list
+                    flat_fees = [] if fee_amount == Decimal("0") else [TokenAmount(amount=fee_amount, token=fee_asset)]
+
+                    # Create TradeFeeBase object based on position action
+                    fee = TradeFeeBase.new_perpetual_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        position_action=position_action,
+                        percent_token=fee_asset,
+                        flat_fees=flat_fees,
+                    )
+
+                    # Create and process the trade update
+                    trade_update = TradeUpdate(
+                        client_order_id=order_id,
+                        exchange_order_id=exchange_order_id,
+                        trade_id=trade_id,
+                        trading_pair=trading_pair,
+                        fee=fee,
+                        fill_price=fill_price,
+                        fill_base_amount=fill_quantity,
+                        fill_quote_amount=fill_price * fill_quantity,
+                        fill_timestamp=transaction_time,
+                    )
+                    self._order_tracker.process_trade_update(trade_update)
+
+                    self.logger().info(
+                        f"Order {order_id} immediately filled at price {fill_price} with quantity {fill_quantity}"
+                    )
+
+            # Return exchange order ID and transaction time as required by the interface
+            return exchange_order_id, transaction_time
+
         except Exception as e:
-            self.logger().error(f"Error in _place_order: {e}", exc_info=True)
+            self.logger().error(f"Error placing order via QTX shared memory: {e}", exc_info=True)
+            # If shared memory order placement fails, propagate the error without fallback
             raise
 
     def _is_order_not_found_during_cancelation_error(self, exception) -> bool:
         """
         Determine if an error from cancel order request is due to order not found
+
+        Handles both Binance API errors and QTX shared memory errors
         """
+        # Check for QTX shared memory specific error messages
+        if isinstance(exception, dict) and "error" in exception:
+            error_msg = exception["error"].lower()
+            return "not exist" in error_msg or "not found" in error_msg
+
+        # Check for string-based error messages from QTX
+        if isinstance(exception, str) and ("not exist" in exception.lower() or "not found" in exception.lower()):
+            return True
+
+        # Delegate to Binance for Binance-format errors
         binance_instance = self.binance_connector
         if binance_instance is None:
             self.logger().error("Binance connector not available: _is_order_not_found_during_cancelation_error failed")
@@ -490,7 +928,19 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     def _is_order_not_found_during_status_update_error(self, exception) -> bool:
         """
         Determine if an error from order status request is due to order not found
+
+        Handles both Binance API errors and QTX shared memory errors
         """
+        # Check for QTX shared memory specific error messages
+        if isinstance(exception, dict) and "error" in exception:
+            error_msg = exception["error"].lower()
+            return "not exist" in error_msg or "not found" in error_msg
+
+        # Check for string-based error messages from QTX
+        if isinstance(exception, str) and ("not exist" in exception.lower() or "not found" in exception.lower()):
+            return True
+
+        # Delegate to Binance for Binance-format errors
         binance_instance = self.binance_connector
         if binance_instance is None:
             self.logger().error(
@@ -601,7 +1051,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             # Clear existing positions to avoid stale data
             for trading_pair in self._trading_pairs:
                 for position_side in [PositionSide.LONG, PositionSide.SHORT]:
-                    pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
+                    pos_key = self._perpetual_trading.position_key(
+                        trading_pair, position_side, self._perpetual_trading.position_mode
+                    )
                     self._perpetual_trading.remove_position(pos_key)
 
             # Process and update positions in QTX's own position tracker
@@ -624,7 +1076,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     leverage = Decimal(position.get("leverage"))
 
                     # Get position key
-                    pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
+                    pos_key = self._perpetual_trading.position_key(
+                        hb_trading_pair, position_side, self._perpetual_trading.position_mode
+                    )
 
                     # Only add positions with non-zero amounts
                     if amount != 0:
@@ -637,13 +1091,14 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             leverage=leverage,
                         )
                         self._perpetual_trading.set_position(pos_key, _position)
+                        self.logger().info(
+                            f"API Position Updated - Key: {pos_key}, "
+                            f"Side: {position_side}, Amount: {amount}, Entry: {entry_price}"
+                        )
                 except (ValueError, TypeError, decimal.InvalidOperation) as e:
                     self.logger().error(f"Error parsing position data: {e}. Position data: {position}", exc_info=True)
                     continue
 
-                else:
-                    # If position amount is 0, remove the position
-                    self._perpetual_trading.remove_position(pos_key)
         except Exception as e:
             self.logger().error(f"Error in _update_positions: {e}", exc_info=True)
 
@@ -715,6 +1170,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 if event_type == "ORDER_TRADE_UPDATE":
                     order_data = event_message.get("o", {})
                     client_order_id = order_data.get("c", "")
+                    
+                    # Log the raw order data for debugging
+                    self.logger().debug(f"ORDER_TRADE_UPDATE received: {order_data}")
 
                     # Find the order in our order tracker
                     tracked_order = self._order_tracker.fetch_order(client_order_id=client_order_id)
@@ -733,7 +1191,38 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
                         # Process filled orders
                         if fill_amount > 0 and fill_price > 0:
-                            fee = {fee_asset: fee_amount} if fee_asset else {}
+                            # Create proper TradeFeeBase object like Binance does
+                            position_side = order_data.get("ps", "BOTH")
+
+                            # Determine position action based on trade type and position side
+                            if position_side == "BOTH":
+                                # If no specific position side, we can't determine position action
+                                position_action = PositionAction.NIL
+                            else:
+                                position_action = (
+                                    PositionAction.OPEN
+                                    if (
+                                        tracked_order.trade_type is TradeType.BUY
+                                        and position_side == "LONG"
+                                        or tracked_order.trade_type is TradeType.SELL
+                                        and position_side == "SHORT"
+                                    )
+                                    else PositionAction.CLOSE
+                                )
+
+                            # Create flat fees list
+                            flat_fees = (
+                                [] if fee_amount == Decimal("0") else [TokenAmount(amount=fee_amount, token=fee_asset)]
+                            )
+
+                            # Create TradeFeeBase object
+                            fee = TradeFeeBase.new_perpetual_fee(
+                                fee_schema=self.trade_fee_schema(),
+                                position_action=position_action,
+                                percent_token=fee_asset,
+                                flat_fees=flat_fees,
+                            )
+
                             # Create proper TradeUpdate object
                             trade_update = TradeUpdate(
                                 client_order_id=tracked_order.client_order_id,
@@ -764,6 +1253,9 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 elif event_type == "ACCOUNT_UPDATE":
                     account_data = event_message.get("a", {})
                     positions_data = account_data.get("P", [])
+                    
+                    # Log the raw position data for debugging
+                    self.logger().debug(f"ACCOUNT_UPDATE received with {len(positions_data)} positions")
 
                     # Process position updates
                     for position in positions_data:
@@ -786,7 +1278,10 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             entry_price = Decimal(position.get("ep", "0"))
                             amount = Decimal(position.get("pa", "0"))
                             unrealized_pnl = Decimal(position.get("up", "0"))
-                            leverage = Decimal(position.get("ma", "1"))
+                            # Binance's ACCOUNT_UPDATE event doesn't include leverage directly
+                            # We can infer it from the margin type or use a default
+                            leverage = Decimal("1")  # Default leverage
+                            self.logger().debug(f"Position data fields: {position.keys()}")
                         except (ValueError, TypeError, decimal.InvalidOperation) as e:
                             self.logger().error(
                                 f"Error parsing position data: {e}. Position data: {position}", exc_info=True
@@ -809,9 +1304,14 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                                 leverage=leverage,
                             )
                             self._perpetual_trading.set_position(pos_key, _position)
+                            self.logger().info(
+                                f"QTX Position Added/Updated - Key: {pos_key}, "
+                                f"Side: {position_side}, Amount: {amount}, Entry: {entry_price}"
+                            )
                         else:
                             # If position amount is 0, remove the position
                             self._perpetual_trading.remove_position(pos_key)
+                            self.logger().info(f"QTX Position Removed - Key: {pos_key}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1061,3 +1561,46 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             binance_instance.tick(timestamp)
         except Exception as e:
             self.logger().error(f"Error during delegation in tick(timestamp): {e}", exc_info=True)
+
+    # ---------------------------------------- Event Forwarding ----------------------------------------
+    def _configure_event_forwarding(self):
+        """
+        Configure event forwarders to relay events from Binance to QTX.
+        This is necessary so that order fills and trade events from Binance
+        get properly recorded in the markets_recorder and history.
+        """
+        if self.binance_connector is None:
+            return
+
+        self.logger().info("Setting up event forwarding from Binance to QTX")
+
+        # Forward key trading events from Binance to QTX
+        event_types = [
+            MarketEvent.OrderFilled,
+            MarketEvent.BuyOrderCompleted,
+            MarketEvent.SellOrderCompleted,
+            MarketEvent.OrderCancelled,
+            MarketEvent.OrderFailure,
+            MarketEvent.BuyOrderCreated,
+            MarketEvent.SellOrderCreated,
+        ]
+
+        for event_type in event_types:
+            forwarder = EventForwarder(
+                to_function=lambda event, evt_type=event_type: self.trigger_event(evt_type, event)
+            )
+            self.binance_connector.add_listener(event_type, forwarder)
+            self._event_forwarders.append((event_type, forwarder))
+
+    def _stop_event_forwarding(self):
+        """
+        Stop all event forwarders when the connector shuts down.
+        """
+        if self.binance_connector is None:
+            return
+
+        for event_type, forwarder in self._event_forwarders:
+            self.binance_connector.remove_listener(event_type, forwarder)
+        self._event_forwarders.clear()
+
+        self.logger().info("Stopped event forwarding from Binance to QTX")
