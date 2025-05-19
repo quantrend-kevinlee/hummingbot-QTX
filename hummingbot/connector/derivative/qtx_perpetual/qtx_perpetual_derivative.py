@@ -33,10 +33,19 @@ from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import TradeFeeBase, TokenAmount
+from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.event.event_forwarder import EventForwarder
-from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    BuyOrderCreatedEvent,
+    MarketEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderFilledEvent,
+    SellOrderCompletedEvent,
+    SellOrderCreatedEvent,
+)
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -119,17 +128,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().warning("Cannot configure event forwarding - Binance connector not available")
             return
 
-        # Import event types we need to forward
-        from hummingbot.core.event.events import (
-            OrderFilledEvent,
-            BuyOrderCompletedEvent,
-            SellOrderCompletedEvent,
-            OrderCancelledEvent,
-            MarketOrderFailureEvent,
-            BuyOrderCreatedEvent,
-            SellOrderCreatedEvent,
-            PositionUpdateEvent,
-        )
+        # Event types are already imported at the module level
 
         # Define event forwarder function
         def create_forwarder(market_event_type):
@@ -152,13 +151,13 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             (MarketEvent.OrderFailure, MarketOrderFailureEvent),
             (MarketEvent.BuyOrderCreated, BuyOrderCreatedEvent),
             (MarketEvent.SellOrderCreated, SellOrderCreatedEvent),
-            (MarketEvent.PositionUpdate, PositionUpdateEvent),
         ]
 
         # Create and register forwarders
         self._event_forwarders = []
         for event_type, event_class in event_mappings:
-            forwarder = create_forwarder(event_type)
+            forward_func = create_forwarder(event_type)
+            forwarder = EventForwarder(forward_func)
             self.binance_connector.add_listener(event_type, forwarder)
             self._event_forwarders.append((event_type, forwarder))
 
@@ -684,6 +683,19 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Place an order using QTX shared memory
         """
+        # IMPORTANT: Track the order BEFORE placing it to handle fast user stream updates
+        # This is the key insight - if we track after placement, ORDER_TRADE_UPDATE might arrive first
+        self.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=None,  # Will be updated when we get the response
+            trading_pair=trading_pair,
+            trade_type=trade_type,
+            price=price,
+            amount=amount,
+            order_type=order_type,
+            position_action=position_action,
+        )
+
         try:
             # Get shared memory manager (connection happens automatically in its methods)
             shm_manager = self.shm_manager
@@ -786,17 +798,25 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             # Get order status and create an order update to immediately reflect the state
             status = order_result.get("status", "NEW")
 
-            # Process the order update in our tracker
-            order_state = self._binance_order_status_to_oms_order_status(status)
-            order_update = OrderUpdate(
-                client_order_id=order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=trading_pair,
-                update_timestamp=transaction_time,
-                new_state=order_state,
-            )
+            # Update the tracked order with the exchange order ID
+            tracked_order = self._order_tracker.fetch_order(client_order_id=order_id)
+            if tracked_order:
+                # Update the exchange order ID in the existing tracked order
+                tracked_order.exchange_order_id = exchange_order_id
 
-            self._order_tracker.process_order_update(order_update)
+                # Process the order update in our tracker
+                order_state = self._binance_order_status_to_oms_order_status(status)
+                order_update = OrderUpdate(
+                    client_order_id=order_id,
+                    exchange_order_id=exchange_order_id,
+                    trading_pair=trading_pair,
+                    update_timestamp=transaction_time,
+                    new_state=order_state,
+                )
+                self._order_tracker.process_order_update(order_update)
+            else:
+                # This should not happen but log it if it does
+                self.logger().error(f"Tracked order {order_id} not found after placement!")
 
             # Sync order state with Binance connector if available
             if self.binance_connector is not None:
@@ -890,11 +910,103 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         f"Order {order_id} immediately filled at price {fill_price} with quantity {fill_quantity}"
                     )
 
+                    # IMPORTANT: Update position immediately for filled order
+                    if position_action != PositionAction.NIL:
+                        # Use the tracked order to determine position side
+                        position_side_enum = PositionSide.LONG if trade_type == TradeType.BUY else PositionSide.SHORT
+
+                        # Get position key
+                        pos_key = self._perpetual_trading.position_key(
+                            trading_pair, position_side_enum, self._perpetual_trading.position_mode
+                        )
+
+                        # Get existing position
+                        existing_position = self._perpetual_trading.get_position(trading_pair, position_side_enum)
+
+                        if position_action == PositionAction.OPEN:
+                            # Opening or adding to position
+                            if existing_position:
+                                # Update existing position
+                                new_amount = existing_position.amount + fill_quantity
+                                new_entry_price = (
+                                    (existing_position.entry_price * existing_position.amount + fill_price * fill_quantity)
+                                    / new_amount
+                                )
+
+                                updated_position = Position(
+                                    trading_pair=trading_pair,
+                                    position_side=position_side_enum,
+                                    unrealized_pnl=existing_position.unrealized_pnl,
+                                    entry_price=new_entry_price,
+                                    amount=new_amount,
+                                    leverage=existing_position.leverage,
+                                )
+
+                                self._perpetual_trading.set_position(pos_key, updated_position)
+                                self.logger().info(
+                                    f"Position updated from order response - {pos_key}: "
+                                    f"{existing_position.amount} -> {new_amount} @ {new_entry_price}"
+                                )
+                            else:
+                                # Create new position
+                                new_position = Position(
+                                    trading_pair=trading_pair,
+                                    position_side=position_side_enum,
+                                    unrealized_pnl=Decimal("0"),
+                                    entry_price=fill_price,
+                                    amount=fill_quantity,
+                                    leverage=Decimal("1"),
+                                )
+
+                                self._perpetual_trading.set_position(pos_key, new_position)
+                                self.logger().info(
+                                    f"New position created from order response - {pos_key}: "
+                                    f"{fill_quantity} @ {fill_price}"
+                                )
+
+                        elif position_action == PositionAction.CLOSE:
+                            # Closing or reducing position
+                            # For closing, we need the opposite side
+                            position_side_enum = PositionSide.SHORT if trade_type == TradeType.BUY else PositionSide.LONG
+                            pos_key = self._perpetual_trading.position_key(
+                                trading_pair, position_side_enum, self._perpetual_trading.position_mode
+                            )
+                            existing_position = self._perpetual_trading.get_position(trading_pair, position_side_enum)
+
+                            if existing_position:
+                                new_amount = existing_position.amount - fill_quantity
+
+                                if abs(new_amount) < Decimal("0.00001"):  # Effectively zero
+                                    # Position fully closed
+                                    self._perpetual_trading.remove_position(pos_key)
+                                    self.logger().info(f"Position closed from order response - {pos_key}")
+                                else:
+                                    # Position reduced
+                                    updated_position = Position(
+                                        trading_pair=trading_pair,
+                                        position_side=position_side_enum,
+                                        unrealized_pnl=existing_position.unrealized_pnl,
+                                        entry_price=existing_position.entry_price,
+                                        amount=new_amount,
+                                        leverage=existing_position.leverage,
+                                    )
+
+                                    self._perpetual_trading.set_position(pos_key, updated_position)
+                                    self.logger().info(
+                                        f"Position reduced from order response - {pos_key}: "
+                                        f"{existing_position.amount} -> {new_amount}"
+                                    )
+
             # Return exchange order ID and transaction time as required by the interface
             return exchange_order_id, transaction_time
 
         except Exception as e:
             self.logger().error(f"Error placing order via QTX shared memory: {e}", exc_info=True)
+            # Clean up the tracked order if placement failed
+            try:
+                self._order_tracker.stop_tracking_order(order_id)
+            except Exception:
+                pass  # Ignore cleanup errors
             # If shared memory order placement fails, propagate the error without fallback
             raise
 
@@ -1170,7 +1282,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 if event_type == "ORDER_TRADE_UPDATE":
                     order_data = event_message.get("o", {})
                     client_order_id = order_data.get("c", "")
-                    
+
                     # Log the raw order data for debugging
                     self.logger().debug(f"ORDER_TRADE_UPDATE received: {order_data}")
 
@@ -1237,6 +1349,97 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             )
                             self._order_tracker.process_trade_update(trade_update)
 
+                            # IMPORTANT: Update position immediately after a trade fill
+                            if position_action != PositionAction.NIL:
+                                # Determine the position side from the order data
+                                position_side = order_data.get("ps", "BOTH")
+
+                                if position_side == "LONG":
+                                    position_side_enum = PositionSide.LONG
+                                elif position_side == "SHORT":
+                                    position_side_enum = PositionSide.SHORT
+                                else:
+                                    # For BOTH position mode, derive position side from trade type and position action
+                                    if position_action == PositionAction.OPEN:
+                                        position_side_enum = PositionSide.LONG if tracked_order.trade_type == TradeType.BUY else PositionSide.SHORT
+                                    else:  # CLOSE
+                                        position_side_enum = PositionSide.SHORT if tracked_order.trade_type == TradeType.BUY else PositionSide.LONG
+
+                                # Get position key
+                                pos_key = self._perpetual_trading.position_key(
+                                    trading_pair, position_side_enum, self._perpetual_trading.position_mode
+                                )
+
+                                # Get existing position
+                                existing_position = self._perpetual_trading.get_position(trading_pair, position_side_enum)
+
+                                if position_action == PositionAction.OPEN:
+                                    # Opening or adding to position
+                                    if existing_position:
+                                        # Update existing position
+                                        new_amount = existing_position.amount + fill_amount
+                                        new_entry_price = (
+                                            (existing_position.entry_price * existing_position.amount + fill_price * fill_amount)
+                                            / new_amount
+                                        )
+
+                                        updated_position = Position(
+                                            trading_pair=trading_pair,
+                                            position_side=position_side_enum,
+                                            unrealized_pnl=existing_position.unrealized_pnl,  # Keep existing PnL for now
+                                            entry_price=new_entry_price,
+                                            amount=new_amount,
+                                            leverage=existing_position.leverage,
+                                        )
+
+                                        self._perpetual_trading.set_position(pos_key, updated_position)
+                                        self.logger().info(
+                                            f"Position updated immediately after trade fill - {pos_key}: "
+                                            f"{existing_position.amount} -> {new_amount} @ {new_entry_price}"
+                                        )
+                                    else:
+                                        # Create new position
+                                        new_position = Position(
+                                            trading_pair=trading_pair,
+                                            position_side=position_side_enum,
+                                            unrealized_pnl=Decimal("0"),
+                                            entry_price=fill_price,
+                                            amount=fill_amount,
+                                            leverage=Decimal("1"),  # Default leverage
+                                        )
+
+                                        self._perpetual_trading.set_position(pos_key, new_position)
+                                        self.logger().info(
+                                            f"New position created immediately after trade fill - {pos_key}: "
+                                            f"{fill_amount} @ {fill_price}"
+                                        )
+
+                                elif position_action == PositionAction.CLOSE:
+                                    # Closing or reducing position
+                                    if existing_position:
+                                        new_amount = existing_position.amount - fill_amount
+
+                                        if abs(new_amount) < Decimal("0.00001"):  # Effectively zero
+                                            # Position fully closed
+                                            self._perpetual_trading.remove_position(pos_key)
+                                            self.logger().info(f"Position closed immediately after trade fill - {pos_key}")
+                                        else:
+                                            # Position reduced
+                                            updated_position = Position(
+                                                trading_pair=trading_pair,
+                                                position_side=position_side_enum,
+                                                unrealized_pnl=existing_position.unrealized_pnl,  # Keep existing PnL
+                                                entry_price=existing_position.entry_price,  # Keep same entry price
+                                                amount=new_amount,
+                                                leverage=existing_position.leverage,
+                                            )
+
+                                            self._perpetual_trading.set_position(pos_key, updated_position)
+                                            self.logger().info(
+                                                f"Position reduced immediately after trade fill - {pos_key}: "
+                                                f"{existing_position.amount} -> {new_amount}"
+                                            )
+
                         # Process order status updates
                         if order_status in ["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"]:
                             # Create proper OrderUpdate object instead of passing individual parameters
@@ -1253,7 +1456,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 elif event_type == "ACCOUNT_UPDATE":
                     account_data = event_message.get("a", {})
                     positions_data = account_data.get("P", [])
-                    
+
                     # Log the raw position data for debugging
                     self.logger().debug(f"ACCOUNT_UPDATE received with {len(positions_data)} positions")
 
@@ -1561,46 +1764,3 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             binance_instance.tick(timestamp)
         except Exception as e:
             self.logger().error(f"Error during delegation in tick(timestamp): {e}", exc_info=True)
-
-    # ---------------------------------------- Event Forwarding ----------------------------------------
-    def _configure_event_forwarding(self):
-        """
-        Configure event forwarders to relay events from Binance to QTX.
-        This is necessary so that order fills and trade events from Binance
-        get properly recorded in the markets_recorder and history.
-        """
-        if self.binance_connector is None:
-            return
-
-        self.logger().info("Setting up event forwarding from Binance to QTX")
-
-        # Forward key trading events from Binance to QTX
-        event_types = [
-            MarketEvent.OrderFilled,
-            MarketEvent.BuyOrderCompleted,
-            MarketEvent.SellOrderCompleted,
-            MarketEvent.OrderCancelled,
-            MarketEvent.OrderFailure,
-            MarketEvent.BuyOrderCreated,
-            MarketEvent.SellOrderCreated,
-        ]
-
-        for event_type in event_types:
-            forwarder = EventForwarder(
-                to_function=lambda event, evt_type=event_type: self.trigger_event(evt_type, event)
-            )
-            self.binance_connector.add_listener(event_type, forwarder)
-            self._event_forwarders.append((event_type, forwarder))
-
-    def _stop_event_forwarding(self):
-        """
-        Stop all event forwarders when the connector shuts down.
-        """
-        if self.binance_connector is None:
-            return
-
-        for event_type, forwarder in self._event_forwarders:
-            self.binance_connector.remove_listener(event_type, forwarder)
-        self._event_forwarders.clear()
-
-        self.logger().info("Stopped event forwarding from Binance to QTX")
