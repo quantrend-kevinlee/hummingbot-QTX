@@ -49,15 +49,17 @@ class QtxPerpetualUDPManagerRealServerTests(IsolatedAsyncioWrapperTestCase):
         cls.base_asset = "BTC"
         cls.quote_asset = "USDT"
         cls.trading_pair = f"{cls.base_asset}-{cls.quote_asset}"
+        # Exchange name for testing
+        cls.exchange_name = "binance-futures"
 
         # Use the trading pair utils for consistent format conversion
-        cls.qtx_symbol = trading_pair_utils.convert_to_qtx_trading_pair(cls.trading_pair)
+        cls.qtx_symbol = trading_pair_utils.convert_to_qtx_trading_pair(cls.trading_pair, cls.exchange_name)
 
         # Second trading pair for multiple symbol tests
         cls.base_asset2 = "ETH"
         cls.quote_asset2 = "USDT"
         cls.trading_pair2 = f"{cls.base_asset2}-{cls.quote_asset2}"
-        cls.qtx_symbol2 = trading_pair_utils.convert_to_qtx_trading_pair(cls.trading_pair2)
+        cls.qtx_symbol2 = trading_pair_utils.convert_to_qtx_trading_pair(cls.trading_pair2, cls.exchange_name)
 
         # Third trading pair removed
 
@@ -79,8 +81,10 @@ class QtxPerpetualUDPManagerRealServerTests(IsolatedAsyncioWrapperTestCase):
         self.log_records = []
         self.listening_task = None
 
-        # Create a fresh UDP manager for each test
-        self.udp_manager = QtxPerpetualUDPManager(host=self.host, port=self.port)
+        # Create a fresh UDP manager for each test with exchange name
+        self.udp_manager = QtxPerpetualUDPManager(
+            host=self.host, port=self.port, exchange_name_on_qtx=self.exchange_name
+        )
 
         # Set up logging
         self.udp_manager.logger().setLevel(1)
@@ -476,7 +480,7 @@ class QtxPerpetualUDPManagerRealServerTests(IsolatedAsyncioWrapperTestCase):
         print(f"\n=== STEP 3: Manually cleaning up subscription for {self.trading_pair} ===")
 
         # Record the exchange symbol (for logging only)
-        exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(self.trading_pair)
+        exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(self.trading_pair, self.exchange_name)
 
         # Note: We're manually removing the subscription data instead of calling the UDP manager's
         # methods because the server might not respond with a valid unsubscribe confirmation
@@ -1348,7 +1352,7 @@ class QtxPerpetualUDPManagerRealServerTests(IsolatedAsyncioWrapperTestCase):
 
             self.assertIn("exchange_symbol", collected_data, "Collected data should include exchange_symbol")
             self.assertEqual(
-                trading_pair_utils.convert_to_qtx_trading_pair(self.trading_pair),
+                trading_pair_utils.convert_to_qtx_trading_pair(self.trading_pair, self.exchange_name),
                 collected_data["exchange_symbol"],
                 "Exchange symbol should match QTX format",
             )
@@ -1466,7 +1470,7 @@ class QtxPerpetualUDPManagerRealServerTests(IsolatedAsyncioWrapperTestCase):
                 self.assertIn("message_count", result, "Result should include message_count")
 
                 # Verify the exchange symbol matches the expected format
-                expected_symbol = trading_pair_utils.convert_to_qtx_trading_pair(pairs[i])
+                expected_symbol = trading_pair_utils.convert_to_qtx_trading_pair(pairs[i], self.exchange_name)
                 self.assertEqual(
                     expected_symbol,
                     result["exchange_symbol"],

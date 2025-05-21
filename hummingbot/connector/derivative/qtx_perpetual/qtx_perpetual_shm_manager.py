@@ -115,13 +115,16 @@ class QtxPerpetualSharedMemoryManager:
         """Returns whether the shared memory manager is connected to the shared memory segment"""
         return self._is_connected
 
-    def __init__(self, api_key: str = None, api_secret: str = None, shm_name: str = None):
+    def __init__(
+        self, api_key: str = None, api_secret: str = None, shm_name: str = None, exchange_name_on_qtx: str = None
+    ):
         """
         Initialize the shared memory manager
 
         :param api_key: API key for authentication
         :param api_secret: API secret for authentication
         :param shm_name: Name of the shared memory segment (required, e.g., "/place_order_kevinlee")
+        :param exchange_name_on_qtx: Exchange name to use for QTX (REQUIRED, no default)
         :raises: ValueError if shm_name is not provided
         """
         if not shm_name:
@@ -133,6 +136,12 @@ class QtxPerpetualSharedMemoryManager:
         self._api_key = api_key
         self._api_secret = api_secret
         self._shm_name = shm_name
+
+        if exchange_name_on_qtx is None:
+            self.logger().warning(
+                "No exchange_name_on_qtx provided to SHM manager! QTX trading pair conversion may fail."
+            )
+        self._exchange_name_on_qtx = exchange_name_on_qtx
 
         # Shared memory objects
         self._shm = None
@@ -427,7 +436,9 @@ class QtxPerpetualSharedMemoryManager:
             # If it's a market order (IOC) with no price, or price is NaN, use a fixed non-zero price
             # Binance requires prices above minimum thresholds even for market orders
             if order_type == QTX_ORDER_TYPE_IOC or is_nan_price:
-                place_order_ref.price = "100.0".encode("utf-8")  # Use 100.0 to circumvent Binance's minimum price threshold
+                place_order_ref.price = "100.0".encode(
+                    "utf-8"
+                )  # Use 100.0 to circumvent Binance's minimum price threshold
                 self.logger().info(f"Setting market order price to 100.0 for order {client_order_id}")
             else:
                 place_order_ref.price = str(price).encode("utf-8")
@@ -648,22 +659,22 @@ class QtxPerpetualSharedMemoryManager:
             qty_match = re.search(r"(quantity|amount|qty)[\":\s]+([\d\.]+)", response)
             if qty_match:
                 response_data["quantity"] = qty_match.group(2)
-            
+
             # Extract executed quantity if present (for filled orders)
             exec_qty_match = re.search(r"(executed_qty|executedQty|filled)[\":\s]+([\d\.]+)", response)
             if exec_qty_match:
                 response_data["executed_qty"] = exec_qty_match.group(2)
-            
+
             # Extract trade ID if present
             trade_id_match = re.search(r"(trade_id|tradeId)[\":\s]+([0-9a-zA-Z]+)", response)
             if trade_id_match:
                 response_data["trade_id"] = trade_id_match.group(2)
-            
+
             # Extract fee information if present
             fee_amount_match = re.search(r"(fee_amount|feeAmount|fee)[\":\s]+([\d\.]+)", response)
             if fee_amount_match:
                 response_data["fee_amount"] = fee_amount_match.group(2)
-            
+
             fee_asset_match = re.search(r"(fee_asset|feeAsset|feeCoin)[\":\s]+([a-zA-Z]+)", response)
             if fee_asset_match:
                 response_data["fee_asset"] = fee_asset_match.group(2)

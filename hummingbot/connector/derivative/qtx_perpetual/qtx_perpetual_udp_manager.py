@@ -17,6 +17,8 @@ from hummingbot.logger import HummingbotLogger
 
 # ---------------------------------------- UDP Manager Class ----------------------------------------
 
+DEFAULT_UDP_BUFFER_SIZE = 65536
+
 
 class QtxPerpetualUDPManager:
     """
@@ -35,13 +37,21 @@ class QtxPerpetualUDPManager:
         self,
         host: str = CONSTANTS.DEFAULT_UDP_HOST,
         port: int = CONSTANTS.DEFAULT_UDP_PORT,
-        buffer_size: int = CONSTANTS.DEFAULT_UDP_BUFFER_SIZE,
+        buffer_size: int = DEFAULT_UDP_BUFFER_SIZE,
+        exchange_name_on_qtx: str = None,
     ):
         """Initialize the UDP manager."""
         # UDP connection settings
         self._host = host
         self._port = port
         self._buffer_size = buffer_size
+
+        # Validate exchange name
+        if exchange_name_on_qtx is None:
+            self.logger().warning(
+                "No exchange_name_on_qtx provided to UDP manager! QTX trading pair conversion may fail."
+            )
+        self._exchange_name_on_qtx = exchange_name_on_qtx
 
         # Socket status
         self._udp_socket = None
@@ -343,14 +353,16 @@ class QtxPerpetualUDPManager:
         # Check for existing exchange symbols
         exchange_symbols_to_pairs = {}
         for trading_pair in new_pairs:
-            exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair)
+            exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair, self._exchange_name_on_qtx)
             exchange_symbols_to_pairs[exchange_symbol] = trading_pair
 
         # Look for duplicates in QTX symbols
         for symbol, pair in list(exchange_symbols_to_pairs.items()):
             # Check if another pair maps to the same exchange symbol
             for existing_pair in self._subscribed_pairs:
-                existing_symbol = trading_pair_utils.convert_to_qtx_trading_pair(existing_pair)
+                existing_symbol = trading_pair_utils.convert_to_qtx_trading_pair(
+                    existing_pair, self._exchange_name_on_qtx
+                )
                 if existing_symbol == symbol:
                     self.logger().info(
                         f"[{subscription_id}] Trading pair {pair} maps to same QTX symbol ({symbol}) "
@@ -537,7 +549,7 @@ class QtxPerpetualUDPManager:
 
             # Find Hummingbot trading pairs corresponding to this QTX symbol
             for hb_pair in list(self._subscribed_pairs):
-                if trading_pair_utils.convert_to_qtx_trading_pair(hb_pair) == qtx_symbol:
+                if trading_pair_utils.convert_to_qtx_trading_pair(hb_pair, self._exchange_name_on_qtx) == qtx_symbol:
                     hb_pairs_for_cleanup.append(hb_pair)
                     # Find all indices assigned to this trading pair
                     for idx, pair in list(self._subscription_indices.items()):
@@ -709,7 +721,9 @@ class QtxPerpetualUDPManager:
                     self.logger().debug(f"[{operation_id}] Trading pair {trading_pair} not subscribed, skipping")
                     continue
 
-                exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair)
+                exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(
+                    trading_pair, self._exchange_name_on_qtx
+                )
                 if exchange_symbol not in qtx_symbol_to_pairs:
                     qtx_symbol_to_pairs[exchange_symbol] = []
                 qtx_symbol_to_pairs[exchange_symbol].append(trading_pair)
@@ -772,6 +786,20 @@ class QtxPerpetualUDPManager:
             )
 
         self._message_callbacks[msg_type] = callback
+
+    @property
+    def subscription_indices(self):
+        """
+        Get a copy of the subscription indices mapping.
+        This allows the derivative connector to see which indices map to which trading pairs.
+        """
+        return self._subscription_indices.copy()
+
+    def listen(self):
+        """
+        Alias for start_listening for backward compatibility
+        """
+        return self.start_listening()
 
     # ---------------------------------------- End of Callback Registration ----------------------------------------
 
@@ -1248,7 +1276,9 @@ class QtxPerpetualUDPManager:
                 self.logger().error(f"[{operation_id}] Failed to subscribe to {trading_pair}, returning empty data")
                 return {
                     "trading_pair": trading_pair,
-                    "exchange_symbol": trading_pair_utils.convert_to_qtx_trading_pair(trading_pair),
+                    "exchange_symbol": trading_pair_utils.convert_to_qtx_trading_pair(
+                        trading_pair, self._exchange_name_on_qtx
+                    ),
                     "bids": [],
                     "asks": [],
                     "update_id": int(time.time() * 1000),
@@ -1267,7 +1297,7 @@ class QtxPerpetualUDPManager:
             collection_start = time.time()
             message_count = 0
             update_id = int(collection_start * 1000)
-            exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair)
+            exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(trading_pair, self._exchange_name_on_qtx)
 
             # We don't use continuous/unlimited data collection anymore
 
@@ -1417,7 +1447,9 @@ class QtxPerpetualUDPManager:
             self.logger().error(f"[{operation_id}] Error collecting market data for {trading_pair}: {e}", exc_info=True)
             return {
                 "trading_pair": trading_pair,
-                "exchange_symbol": trading_pair_utils.convert_to_qtx_trading_pair(trading_pair),
+                "exchange_symbol": trading_pair_utils.convert_to_qtx_trading_pair(
+                    trading_pair, self._exchange_name_on_qtx
+                ),
                 "bids": [],
                 "asks": [],
                 "update_id": int(time.time() * 1000),

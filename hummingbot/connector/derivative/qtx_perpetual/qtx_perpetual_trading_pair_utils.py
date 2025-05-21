@@ -3,90 +3,36 @@
 """
 Centralized utilities for trading pair conversions in the QTX perpetual connector.
 
-This module consolidates all trading pair conversion functions that were previously
-scattered across web_utils.py and utils.py. This eliminates redundancy and ensures
-
-consistent behavior throughout the connector.
-
-These utilities are critical for translating between:
+This module handles conversions between:
 1. Hummingbot format (e.g., "BTC-USDT")
 2. QTX UDP format (e.g., "binance-futures:btcusdt")
-3. Binance API format (e.g., "BTCUSDT")
+
+Note: Conversions to/from exchange-specific formats (e.g., Binance's "BTCUSDT")
+should be handled by the respective exchange's utility modules.
 """
 
 from typing import List, Optional
 
 
-def format_trading_pair(trading_pair: str) -> str:
-    """
-    Basic formatting: Converts Hummingbot trading pair to lowercase without separator
-    Example: BTC-USDT -> btcusdt
-
-    This is the foundation for other conversion functions.
-    """
-    return trading_pair.replace("-", "").lower()
-
-
-def convert_to_binance_trading_pair(trading_pair: str) -> str:
-    """
-    Convert from Hummingbot trading pair format to Binance format.
-    Example: BTC-USDT -> BTCUSDT
-
-    This format is used for API calls to Binance.
-    """
-    return trading_pair.replace("-", "")
-
-
-def convert_from_binance_trading_pair(binance_symbol: str, trading_pairs: Optional[List[str]] = None) -> str:
-    """
-    Convert from Binance format to Hummingbot trading pair format.
-    Example: BTCUSDT -> BTC-USDT
-
-    :param binance_symbol: Trading pair in Binance format
-    :param trading_pairs: List of available trading pairs to match against (optional)
-    :return: Trading pair in Hummingbot format
-    """
-    # First try direct match with trading_pairs if provided
-    if trading_pairs:
-        for tp in trading_pairs:
-            if binance_symbol.upper() == tp.replace("-", "").upper():
-                return tp
-
-    # Common quote currencies in perpetual futures (from longest to shortest to avoid misidentification)
-    quote_currencies = ["USDT", "BUSD", "USDC", "USD", "DAI", "BTC", "ETH"]
-
-    # Convert to uppercase for standard processing
-    binance_symbol = binance_symbol.upper()
-
-    # Try to identify where to insert the dash by looking for common quote currencies
-    for quote in quote_currencies:
-        if binance_symbol.endswith(quote):
-            base = binance_symbol[:-len(quote)]
-            return f"{base}-{quote}"
-
-    # If no clear split point is found, make a best guess
-    # Usually the last 3-4 characters are the quote currency
-    if len(binance_symbol) > 5:
-        # Try to guess with common lengths (4 for USDT, 3 for BTC, etc.)
-        for split_point in [4, 3]:
-            if len(binance_symbol) > split_point:
-                base = binance_symbol[:-split_point]
-                quote = binance_symbol[-split_point:]
-                return f"{base}-{quote}"
-
-    # If all else fails, just return the original symbol
-    return binance_symbol
-
-
-def convert_to_qtx_trading_pair(trading_pair: str) -> str:
+def convert_to_qtx_trading_pair(trading_pair: str, exchange_name: str = None) -> str:
     """
     Convert from Hummingbot trading pair format to QTX UDP format.
     Example: BTC-USDT -> binance-futures:btcusdt
 
     This format is used specifically for QTX UDP market data subscription.
+
+    :param trading_pair: Trading pair in Hummingbot format (e.g., "BTC-USDT")
+    :param exchange_name: Exchange name to use in the prefix (REQUIRED, no default)
+                         Must be the full exchange name as used by QTX (e.g., "binance-futures")
+    :return: Trading pair in QTX format
+    :raises: ValueError if exchange_name is not provided
     """
-    formatted_pair = format_trading_pair(trading_pair)
-    return f"binance-futures:{formatted_pair}"
+    if exchange_name is None:
+        raise ValueError("exchange_name must be provided for QTX trading pair conversion")
+
+    # Remove dash and convert to lowercase for QTX format
+    formatted_pair = trading_pair.replace("-", "").lower()
+    return f"{exchange_name}:{formatted_pair}"
 
 
 def convert_from_qtx_trading_pair(qtx_symbol: str, trading_pairs: Optional[List[str]] = None) -> str:
@@ -106,11 +52,33 @@ def convert_from_qtx_trading_pair(qtx_symbol: str, trading_pairs: Optional[List[
     else:
         symbol = qtx_symbol
 
-    # Convert using the Binance symbol conversion since underlying format is the same
-    return convert_from_binance_trading_pair(symbol, trading_pairs)
+    # Convert to uppercase for processing
+    symbol = symbol.upper()
 
+    # First try direct match with trading_pairs if provided
+    if trading_pairs:
+        for tp in trading_pairs:
+            if symbol == tp.replace("-", "").upper():
+                return tp
 
-# Aliases for backward compatibility - these names should be used with caution
-# and eventually deprecated
-convert_to_exchange_trading_pair = convert_to_qtx_trading_pair
-convert_from_exchange_trading_pair = convert_from_qtx_trading_pair
+    # Common quote currencies in perpetual futures (from longest to shortest to avoid misidentification)
+    quote_currencies = ["USDT", "BUSD", "USDC", "USD", "DAI", "BTC", "ETH"]
+
+    # Try to identify where to insert the dash by looking for common quote currencies
+    for quote in quote_currencies:
+        if symbol.endswith(quote):
+            base = symbol[: -len(quote)]
+            return f"{base}-{quote}"
+
+    # If no clear split point is found, make a best guess
+    # Usually the last 3-4 characters are the quote currency
+    if len(symbol) > 5:
+        # Try to guess with common lengths (4 for USDT, 3 for BTC, etc.)
+        for split_point in [4, 3]:
+            if len(symbol) > split_point:
+                base = symbol[:-split_point]
+                quote = symbol[-split_point:]
+                return f"{base}-{quote}"
+
+    # If all else fails, return the symbol with uppercase
+    return symbol
