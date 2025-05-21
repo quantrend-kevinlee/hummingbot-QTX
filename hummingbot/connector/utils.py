@@ -2,6 +2,8 @@ import gzip
 import json
 import os
 import platform
+import random
+import time
 from collections import namedtuple
 from hashlib import md5
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -11,7 +13,7 @@ from hexbytes import HexBytes
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.api_throttler.async_throttler_base import AsyncThrottlerBase
-from hummingbot.core.utils.tracking_nonce import NonceCreator, get_tracking_nonce
+from hummingbot.core.utils.tracking_nonce import NonceCreator
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSResponse
 from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -51,36 +53,30 @@ def get_new_client_order_id(
     is_buy: bool, trading_pair: str, hbot_order_id_prefix: str = "", max_id_len: Optional[int] = None
 ) -> str:
     """
-    Creates a client order id for a new order
-
-    Note: If the need for much shorter IDs arises, an option is to concatenate the host name, the PID,
-    and the nonce, and hash the result.
-
+    Creates a pure integer client order id for a new order
     :param is_buy: True if the order is a buy order, False otherwise
-    :param trading_pair: the trading pair the order will be operating with
-    :param hbot_order_id_prefix: The hummingbot-specific identifier for the given exchange
-    :param max_id_len: The maximum length of the ID string.
-    :return: an identifier for the new order to be used in the client
+    :param trading_pair: the trading pair the order will be operating with (not used in integer ID generation)
+    :param hbot_order_id_prefix: The hummingbot-specific identifier (ignored to generate pure integer)
+    :param max_id_len: The maximum length of the ID string (applied to the final string representation)
+    :return: a pure integer identifier for the new order to be used in the client
     """
-    side = "B" if is_buy else "S"
-    symbols = split_hb_trading_pair(trading_pair)
-    base = symbols[0].upper()
-    quote = symbols[1].upper()
-    base_str = f"{base[0]}{base[-1]}"
-    quote_str = f"{quote[0]}{quote[-1]}"
-    client_instance_id = _bot_instance_id()
-    ts_hex = hex(get_tracking_nonce())[2:]
-    client_order_id = f"{hbot_order_id_prefix}{side}{base_str}{quote_str}{ts_hex}{client_instance_id}"
-
-    if max_id_len is not None:
-        id_prefix = f"{hbot_order_id_prefix}{side}{base_str}{quote_str}"
-        suffix_max_length = max_id_len - len(id_prefix)
-        if suffix_max_length < len(ts_hex):
-            id_suffix = md5(f"{ts_hex}{client_instance_id}".encode()).hexdigest()
-            client_order_id = f"{id_prefix}{id_suffix[:suffix_max_length]}"
-        else:
-            client_order_id = client_order_id[:max_id_len]
-    return client_order_id
+    # Generate components for a unique ID
+    timestamp = int(time.time() * 1000)  # millisecond precision
+    random_component = random.randint(1000, 9999)  # 4-digit random number
+    side_digit = 1 if is_buy else 2  # 1 for buy, 2 for sell
+    # Create a numeric ID in format: SIDE + TIMESTAMP + RANDOM
+    # This creates IDs like: 11684231490001234
+    numeric_id = int(f"{side_digit}{timestamp}{random_component}")
+    # Handle long long size limitations (typically 2^63-1 or 9,223,372,036,854,775,807)
+    # Ensure our ID doesn't exceed this limit for C/C++ shared memory compatibility
+    max_c_long_long = (2**63) - 1
+    numeric_id = min(numeric_id, max_c_long_long)
+    # Convert to string and apply max_id_len if necessary
+    result = str(numeric_id)
+    if max_id_len is not None and len(result) > max_id_len:
+        # If truncating, keep the most significant parts (from the beginning)
+        result = result[:max_id_len]
+    return result
 
 
 def get_new_numeric_client_order_id(nonce_creator: NonceCreator, max_id_bit_count: Optional[int] = None) -> int:
@@ -88,7 +84,7 @@ def get_new_numeric_client_order_id(nonce_creator: NonceCreator, max_id_bit_coun
     host_part = int(hexa_hash, 16)
     client_order_id = int(f"{host_part}{nonce_creator.get_tracking_nonce()}")
     if max_id_bit_count:
-        max_int = 2 ** max_id_bit_count - 1
+        max_int = 2**max_id_bit_count - 1
         client_order_id &= max_int
     return client_order_id
 
