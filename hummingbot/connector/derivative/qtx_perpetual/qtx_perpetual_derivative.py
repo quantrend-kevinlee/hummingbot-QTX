@@ -43,10 +43,6 @@ EXCHANGE_CONNECTOR_CLASSES = {
 class QtxPerpetualDerivative(PerpetualDerivativePyBase):
     """Dynamic connector that creates runtime subclass of specified exchange backend"""
 
-    SHORT_POLL_INTERVAL = 5.0
-    UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
-    LONG_POLL_INTERVAL = 120.0
-
     def __new__(
         cls,
         client_config_map: "ClientConfigAdapter",
@@ -642,15 +638,24 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
             async def stop_network(self):
                 """Stops UDP and shared memory connections"""
-                # Stop parent network components first
+                # First handle QTX-specific cleanup
+                # Unsubscribe from all trading pairs first
                 try:
-                    await super().stop_network()
+                    if self.udp_manager is not None and self.udp_manager._is_connected:
+                        trading_pairs = list(self.udp_manager._subscribed_pairs)
+                        if trading_pairs:
+                            self.logger().info(f"Unsubscribing from {len(trading_pairs)} trading pairs")
+                            try:
+                                await self.udp_manager.unsubscribe_from_trading_pairs(trading_pairs)
+                            except Exception as e:
+                                self.logger().error(f"Error unsubscribing from trading pairs: {e}", exc_info=True)
                 except Exception as e:
-                    self.logger().error(f"Error in parent stop_network: {e}", exc_info=True)
+                    self.logger().error(f"Error during unsubscription process: {e}", exc_info=True)
+
                 # Stop UDP manager if it exists
                 if self.udp_manager is not None:
                     try:
-                        # Stop the listening task first
+                        # Stop the listening task - this will also close the socket
                         if (
                             hasattr(self.udp_manager, "_listening_task")
                             and self.udp_manager._listening_task is not None
@@ -663,6 +668,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         self.logger().error(f"Error stopping UDP manager: {e}", exc_info=True)
                     finally:
                         self._udp_manager = None
+                
                 # Clean up shared memory manager
                 if self.shm_manager is not None:
                     try:
@@ -673,6 +679,12 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         self.logger().error(f"Error disconnecting shared memory manager: {e}", exc_info=True)
                     finally:
                         self._shm_manager = None
+                
+                # Finally stop parent network components after QTX resources are cleaned up
+                try:
+                    await super().stop_network()
+                except Exception as e:
+                    self.logger().error(f"Error in parent stop_network: {e}", exc_info=True)
 
         # Prepare initialization parameters for the base exchange class
         init_params = {

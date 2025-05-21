@@ -512,21 +512,20 @@ class QtxPerpetualUDPManager:
         :param qtx_symbol: QTX formatted symbol (e.g., "binance-futures:btcusdt")
         :return: True if successful, False otherwise
         """
-        # Generate unique unsubscription ID for logging
-        unsubscribe_id = f"unsub_{int(time.time())}"
+        # ID no longer needed for logging
 
         if not self._is_connected or self._udp_socket is None:
-            self.logger().warning(f"[{unsubscribe_id}] Cannot unsubscribe from {qtx_symbol}: not connected")
+            self.logger().warning(f"Cannot unsubscribe from {qtx_symbol}: not connected")
             return False
 
         try:
-            # TEMPORARY DEBUG: Output the socket state and more details for debugging subscription issues
-            self.logger().info(
-                f"[{unsubscribe_id}] DEBUG: Socket state before unsubscribe - connected: {self._is_connected}, "
+            # Log socket state at debug level only
+            self.logger().debug(
+                f"Socket state before unsubscribe - connected: {self._is_connected}, "
                 f"socket is None: {self._udp_socket is None}, "
                 f"subscribed pairs: {self._subscribed_pairs}"
             )
-            self.logger().info(f"[{unsubscribe_id}] DEBUG: Current subscription indices: {self._subscription_indices}")
+            self.logger().debug(f"Current subscription indices: {self._subscription_indices}")
 
             # Set socket to blocking for unsubscribe
             self._udp_socket.setblocking(True)
@@ -535,10 +534,8 @@ class QtxPerpetualUDPManager:
             # Format unsubscribe message
             unsubscribe_msg = f"-{qtx_symbol}"
             unsubscribe_bytes = unsubscribe_msg.encode()
-            self.logger().info(f"[{unsubscribe_id}] Unsubscribing from symbol: {qtx_symbol}")
-            self.logger().debug(
-                f"[{unsubscribe_id}] Sending unsubscribe request: {unsubscribe_bytes!r} (hex: {unsubscribe_bytes.hex()})"
-            )
+            self.logger().debug(f"Unsubscribing from symbol: {qtx_symbol}")
+            self.logger().debug(f"Sending unsubscribe request: {unsubscribe_bytes!r} (hex: {unsubscribe_bytes.hex()})")
 
             # Before unsubscribing, we need to find the associated trading pair and indices for later cleanup
             # For the given QTX symbol, find the corresponding Hummingbot trading pair
@@ -555,10 +552,7 @@ class QtxPerpetualUDPManager:
                             indices_for_cleanup.append(idx)
 
             if indices_for_cleanup:
-                self.logger().debug(
-                    f"[{unsubscribe_id}] Found indices {indices_for_cleanup} for QTX symbol {qtx_symbol} "
-                    f"(trading pairs: {hb_pairs_for_cleanup})"
-                )
+                self.logger().debug(f"Found indices {indices_for_cleanup} for QTX symbol {qtx_symbol} (trading pairs: {hb_pairs_for_cleanup})")
 
             # Try sending the unsubscribe message multiple times to ensure it's delivered
             max_attempts = 3
@@ -572,34 +566,26 @@ class QtxPerpetualUDPManager:
                 # Wait for response
                 try:
                     response, addr = self._udp_socket.recvfrom(self._buffer_size)
-                    self.logger().debug(
-                        f"[{unsubscribe_id}] Received raw unsubscribe response from {addr}: {response!r} (hex: {response.hex()})"
-                    )
+                    self.logger().debug(f"Received raw unsubscribe response from {addr}: {response!r} (hex: {response.hex()})")
 
                     try:
                         # Try to parse as text first - might be an ACK or success message
                         response_text = response.decode().strip()
-                        self.logger().info(f"[{unsubscribe_id}] Unsubscribe response for {qtx_symbol}: {response_text}")
+                        self.logger().debug(f"Unsubscribe response for {qtx_symbol}: {response_text}")
 
                         # Try to extract an unsubscribe index if the response contains it
                         try:
                             unsubscribe_index = int(response_text)
-                            self.logger().info(
-                                f"[{unsubscribe_id}] Received unsubscribe index {unsubscribe_index} for {qtx_symbol}"
-                            )
+                            self.logger().debug(f"Received unsubscribe index {unsubscribe_index} for {qtx_symbol}")
                             # If we got a numeric response, consider unsubscription successful
                             unsubscribe_success = True
                         except ValueError:
                             # Not a number but still a text response
                             if "unsubscribed" in response_text.lower():
-                                self.logger().info(
-                                    f"[{unsubscribe_id}] Received unsubscribe confirmation for {qtx_symbol}: {response_text}"
-                                )
+                                self.logger().debug(f"Received unsubscribe confirmation for {qtx_symbol}: {response_text}")
                                 unsubscribe_success = True  # noqa: F841
                             else:
-                                self.logger().debug(
-                                    f"[{unsubscribe_id}] Received text response but not unsubscribe confirmation: {response_text}"
-                                )
+                                self.logger().debug(f"Received text response but not unsubscribe confirmation: {response_text}")
                                 # Keep trying - might be other messages in the queue
                                 continue
 
@@ -610,32 +596,21 @@ class QtxPerpetualUDPManager:
                         if len(response) >= 40:
                             try:
                                 msg_type, index, *_ = struct.unpack("<iiqqqq", response[:40])
-                                self.logger().debug(
-                                    f"[{unsubscribe_id}] Received market data during unsubscribe: "
-                                    f"type={msg_type}, index={index}"
-                                )
+                                self.logger().debug(f"Received market data during unsubscribe: type={msg_type}, index={index}")
                                 # Skip market data and continue waiting for unsubscribe response
                                 continue
                             except struct.error:
                                 pass
 
-                        self.logger().info(
-                            f"[{unsubscribe_id}] Received binary response for {qtx_symbol} (hex: {response.hex()})"
-                        )
+                        self.logger().debug(f"Received binary response for {qtx_symbol} (hex: {response.hex()})")
                         # Continue waiting for a proper text response
                         continue
 
                 except socket.timeout:
-                    self.logger().warning(
-                        f"[{unsubscribe_id}] Timeout waiting for unsubscribe response for {qtx_symbol} "
-                        f"(attempt {attempt}/{max_attempts})"
-                    )
+                    self.logger().warning(f"Timeout waiting for unsubscribe response for {qtx_symbol} (attempt {attempt}/{max_attempts})")
                     # Only retry if we haven't reached max attempts
                     if attempt == max_attempts:
-                        self.logger().error(
-                            f"[{unsubscribe_id}] Failed to get unsubscribe confirmation for {qtx_symbol} "
-                            f"after {max_attempts} attempts"
-                        )
+                        self.logger().error(f"Failed to get unsubscribe confirmation for {qtx_symbol} after {max_attempts} attempts")
 
             # Even if we didn't get a clear confirmation, proceed with cleanup
             # This is safer than leaving stale entries in the tracking structures
@@ -660,32 +635,26 @@ class QtxPerpetualUDPManager:
 
             # Log cleanup results
             if pairs_removed or indices_removed:
-                self.logger().info(
-                    f"[{unsubscribe_id}] Cleaned up after unsubscribing from {qtx_symbol}: "
-                    f"removed {len(pairs_removed)} trading pairs and {len(indices_removed)} indices"
-                )
+                self.logger().debug(f"Cleaned up after unsubscribing from {qtx_symbol}: removed {len(pairs_removed)} trading pairs and {len(indices_removed)} indices")
                 if self.logger().isEnabledFor(logging.DEBUG):
-                    self.logger().debug(f"[{unsubscribe_id}] Removed pairs: {pairs_removed}")
-                    self.logger().debug(f"[{unsubscribe_id}] Removed indices: {indices_removed}")
+                    self.logger().debug(f"Removed pairs: {pairs_removed}")
+                    self.logger().debug(f"Removed indices: {indices_removed}")
 
             # Check if the received unsubscribe index matches one of our indices
             if unsubscribe_index is not None and unsubscribe_index not in indices_removed:
-                self.logger().warning(
-                    f"[{unsubscribe_id}] Received unsubscribe index {unsubscribe_index} for {qtx_symbol}, "
-                    f"but this index was not in our tracked indices: {indices_for_cleanup}"
-                )
+                self.logger().warning(f"Received unsubscribe index {unsubscribe_index} for {qtx_symbol}, but this index was not in our tracked indices: {indices_for_cleanup}")
 
             # Set socket back to non-blocking
             try:
                 self._udp_socket.setblocking(False)
             except Exception as e:
-                self.logger().error(f"[{unsubscribe_id}] Error setting socket to non-blocking: {e}", exc_info=True)
+                self.logger().error(f"Error setting socket to non-blocking: {e}", exc_info=True)
                 # Not a critical error, we can continue
 
             return True
 
         except Exception as e:
-            self.logger().error(f"[{unsubscribe_id}] Error unsubscribing from {qtx_symbol}: {e}", exc_info=True)
+            self.logger().error(f"Error unsubscribing from {qtx_symbol}: {e}", exc_info=True)
             # Try to set socket back to non-blocking
             try:
                 if self._udp_socket is not None:
@@ -701,22 +670,21 @@ class QtxPerpetualUDPManager:
         :param trading_pairs: List of trading pairs to unsubscribe from
         :return: True if successful, False otherwise
         """
-        # Generate unique operation ID for logging
-        operation_id = f"unsubgroup_{int(time.time())}"
+        # Operation ID no longer needed for logging
 
         if not self._is_connected or self._udp_socket is None:
-            self.logger().warning(f"[{operation_id}] Cannot unsubscribe: not connected or socket is None")
+            self.logger().warning(f"Cannot unsubscribe: not connected or socket is None")
             return False
 
         try:
-            self.logger().info(f"[{operation_id}] Unsubscribing from {len(trading_pairs)} trading pairs")
+            self.logger().info(f"Unsubscribing from {len(trading_pairs)} trading pairs")
 
             # Group trading pairs by QTX symbol for more efficient unsubscription
             # Multiple Hummingbot trading pairs might map to the same QTX symbol
             qtx_symbol_to_pairs = {}
             for trading_pair in trading_pairs:
                 if trading_pair not in self._subscribed_pairs:
-                    self.logger().debug(f"[{operation_id}] Trading pair {trading_pair} not subscribed, skipping")
+                    self.logger().debug(f"Trading pair {trading_pair} not subscribed, skipping")
                     continue
 
                 exchange_symbol = trading_pair_utils.convert_to_qtx_trading_pair(
@@ -731,32 +699,28 @@ class QtxPerpetualUDPManager:
             pairs_processed = []
 
             for exchange_symbol, pairs in qtx_symbol_to_pairs.items():
-                self.logger().debug(
-                    f"[{operation_id}] Unsubscribing from QTX symbol {exchange_symbol} for pairs: {pairs}"
-                )
+                self.logger().debug(f"Unsubscribing from QTX symbol {exchange_symbol} for pairs: {pairs}")
                 result = await self.unsubscribe_from_symbol(exchange_symbol)
 
                 # The unsubscribe_from_symbol method already handles cleanup of tracking structures
                 # We just need to track success/failure and process results
                 if result:
                     pairs_processed.extend(pairs)
-                    self.logger().info(f"[{operation_id}] Successfully unsubscribed from QTX symbol {exchange_symbol}")
+                    self.logger().debug(f"Successfully unsubscribed from QTX symbol {exchange_symbol}")
                 else:
                     success = False
-                    self.logger().error(f"[{operation_id}] Failed to unsubscribe from QTX symbol {exchange_symbol}")
+                    self.logger().error(f"Failed to unsubscribe from QTX symbol {exchange_symbol}")
 
             # Log summary
             if pairs_processed:
-                self.logger().info(
-                    f"[{operation_id}] Unsubscription complete: {len(pairs_processed)} trading pairs processed"
-                )
+                self.logger().info(f"Unsubscription complete: {len(pairs_processed)} trading pairs processed")
             else:
-                self.logger().warning(f"[{operation_id}] No trading pairs were processed during unsubscription")
+                self.logger().warning(f"No trading pairs were processed during unsubscription")
 
             return success
 
         except Exception as e:
-            self.logger().error(f"[{operation_id}] Error during unsubscription: {e}", exc_info=True)
+            self.logger().error(f"Error during unsubscription: {e}", exc_info=True)
             return False
 
     async def unsubscribe_from_all(self):
