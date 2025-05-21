@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """
-QTX Perpetual Derivative Connector with dynamic exchange backend support.
-This connector uses QTX's market data and shared memory order placement/cancellation combined with a selected exchange's trading
-capabilities (Binance, OKX, Bybit, etc.) to provide a hybrid trading solution.
+QTX Perpetual Derivative Connector with dynamic exchange backend
+Integrates QTX market data via UDP with parent exchange trading capabilities
 """
 import asyncio
 import importlib
@@ -42,9 +41,7 @@ EXCHANGE_CONNECTOR_CLASSES = {
 
 
 class QtxPerpetualDerivative(PerpetualDerivativePyBase):
-    """
-    QtxPerpetualDerivative that dynamically creates a connector based on the specified exchange backend.
-    """
+    """Dynamic connector that creates runtime subclass of specified exchange backend"""
 
     SHORT_POLL_INTERVAL = 5.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
@@ -62,10 +59,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
     ):
-        """
-        Create a new instance of a dynamic QTX connector with the specified exchange backend.
-        This uses Python's __new__ to return a custom subclass instance.
-        """
+        """Creates dynamic connector with specified exchange backend"""
         # Validate required parameters
         if not exchange_backend:
             raise ValueError("exchange_backend is required")
@@ -88,9 +82,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
         # Create a dynamic class that inherits from the selected exchange
         class QtxDynamicConnector(base_exchange_class):
-            """
-            Dynamic connector that uses QTX market data with a selected exchange's trading capabilities.
-            """
+            """QTX market data with parent exchange trading capabilities"""
 
             def __init__(self, *args, **kwargs):
                 # Extract QTX-specific parameters
@@ -119,7 +111,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
             @property
             def udp_manager(self) -> QtxPerpetualUDPManager:
-                """Get the UDP manager instance, creating it if needed."""
+                """Returns UDP manager instance, creating if needed"""
                 if self._udp_manager is None:
                     # Get exchange name from EXCHANGE_CONNECTOR_CLASSES
                     exchange_info = EXCHANGE_CONNECTOR_CLASSES.get(self._exchange_backend.lower(), {})
@@ -139,7 +131,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
 
             @property
             def shm_manager(self) -> Optional[QtxPerpetualSharedMemoryManager]:
-                """Get the shared memory manager instance, creating it if needed."""
+                """Returns SHM manager instance, creating if needed"""
                 if self._shm_manager is None and self._qtx_shared_memory_name:
                     # Get exchange name from EXCHANGE_CONNECTOR_CLASSES
                     exchange_info = EXCHANGE_CONNECTOR_CLASSES.get(self._exchange_backend.lower(), {})
@@ -156,14 +148,14 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         shm_name=self._qtx_shared_memory_name,
                         exchange_name_on_qtx=exchange_name_on_qtx,
                     )
-                    self.logger().info(
+                    self.logger().debug(
                         f"Shared memory manager initialized with segment '{self._qtx_shared_memory_name}' "
                         f"for exchange '{exchange_name_on_qtx}'"
                     )
                 return self._shm_manager
 
             def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
-                """Create order book data source that uses parent exchange's implementation with QTX market data."""
+                """Creates order book data source with QTX market data"""
                 # Create the parent exchange's order book data source
                 parent_data_source = super()._create_order_book_data_source()
                 # Initialize UDP manager for QTX market data
@@ -174,21 +166,21 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     await self._setup_qtx_udp_subscriptions()
 
                 async def qtx_listen_for_order_book_diffs(ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-                    """Listen for orderbook diffs from QTX UDP"""
+                    """Processes order book diff messages"""
                     await self._listen_for_qtx_order_book_diffs(output)
 
                 async def qtx_listen_for_order_book_snapshots(
                     ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue
                 ):
-                    """Listen for orderbook snapshots from QTX UDP"""
+                    """Processes order book snapshot messages"""
                     await self._listen_for_qtx_order_book_snapshots(output)
 
                 async def qtx_listen_for_trades(ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-                    """Listen for trades from QTX UDP"""
+                    """Processes trade messages"""
                     await self._listen_for_qtx_trades(output)
 
                 async def qtx_order_book_snapshot(trading_pair: str) -> OrderBookMessage:
-                    """Get order book snapshot for a trading pair using QTX UDP data"""
+                    """Collects and returns order book snapshot for trading pair"""
                     return await self._get_qtx_order_book_snapshot(trading_pair)
 
                 # Replace only the market data methods
@@ -210,9 +202,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 position_action: PositionAction = PositionAction.NIL,
                 **kwargs,
             ) -> Tuple[str, float]:
-                """
-                Place an order using QTX shared memory if available, otherwise delegate to parent exchange.
-                """
+                """Places order using QTX shared memory"""
                 if self.shm_manager is not None:
                     # Use QTX shared memory for order placement
                     try:
@@ -226,7 +216,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         
                         # Use the parent exchange's method to convert from Hummingbot to exchange format
                         exchange_pair = await super().exchange_symbol_associated_to_pair(trading_pair)
-                        self.logger().info(
+                        self.logger().debug(
                             f"Order placement: Converting {trading_pair} to exchange format: {exchange_pair}"
                         )
                         
@@ -282,7 +272,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         exchange_order_id = result.get("exchange_order_id", order_id)
                         transaction_time = result.get("transaction_time", self.current_timestamp)
                         
-                        self.logger().info(
+                        self.logger().debug(
                             f"Order placed via shared memory - Client ID: {order_id}, Exchange ID: {exchange_order_id}"
                         )
 
@@ -294,15 +284,13 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     raise Exception("QTX shared memory manager is not initialized. Order placement failed.")
 
             async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
-                """
-                Cancel an order using QTX shared memory if available, otherwise delegate to parent exchange.
-                """
+                """Cancels order using QTX shared memory"""
                 if self.shm_manager is not None:
                     # Use QTX shared memory for order cancellation
                     try:
                         # Use the parent exchange's method to convert from Hummingbot to exchange format
                         exchange_pair = await super().exchange_symbol_associated_to_pair(tracked_order.trading_pair)
-                        self.logger().info(
+                        self.logger().debug(
                             f"Order cancellation: Converting {tracked_order.trading_pair} to exchange format: {exchange_pair}"
                         )
                         success, response_data = await self.shm_manager.cancel_order(
@@ -310,7 +298,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             symbol=exchange_pair,
                         )
                         if success:
-                            self.logger().info(f"Order cancelled successfully via QTX shared memory: {order_id}")
+                            self.logger().debug(f"Order cancelled successfully via QTX shared memory: {order_id}")
                             return True
                         else:
                             error_msg = response_data.get("error", "Unknown error")
@@ -328,7 +316,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     raise Exception("QTX shared memory manager is not initialized. Order cancellation failed.")
 
             def _setup_qtx_market_data(self, parent_data_source):
-                """Setup QTX market data integration with the parent data source"""
+                """Sets up QTX market data integration"""
                 # Initialize message queues
                 self._message_queue = {
                     "snapshots": asyncio.Queue(),  # Keep for compatibility but QTX doesn't send snapshots
@@ -345,10 +333,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     self._empty_orderbook[trading_pair] = True
 
             async def _handle_ticker_message(self, message):
-                """
-                Process ticker messages (type 1/-1) from QTX UDP feed.
-                :param message: The parsed ticker message from the UDP manager
-                """
+                """Processes ticker messages (type 1/-1) from UDP feed"""
                 # Extract the trading pair from the message
                 trading_pair = self._get_trading_pair_from_message(message)
                 if not trading_pair:
@@ -398,10 +383,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 self._message_queue["diffs"].put_nowait(order_book_message)
 
             async def _handle_depth_message(self, message):
-                """
-                Process depth messages (type 2) from QTX UDP feed.
-                :param message: The parsed depth message from the UDP manager
-                """
+                """Processes order book depth messages (type 2) from UDP feed"""
                 # Extract the trading pair from the message
                 trading_pair = self._get_trading_pair_from_message(message)
                 if not trading_pair:
@@ -448,10 +430,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     )
 
             async def _handle_trade_message(self, message):
-                """
-                Process trade messages (type 3/-3) from QTX UDP feed.
-                :param message: The parsed trade message from the UDP manager
-                """
+                """Processes trade messages (type 3/-3) from UDP feed"""
                 # Extract the trading pair from the message
                 trading_pair = self._get_trading_pair_from_message(message)
                 if not trading_pair:
@@ -499,11 +478,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 self._message_queue["trades"].put_nowait(trade_message)
 
             def _get_trading_pair_from_message(self, message) -> Optional[str]:
-                """
-                Extract the trading pair from a message, handling different message formats.
-                :param message: The message from the UDP manager
-                :return: Trading pair string or None if not found
-                """
+                """Extracts trading pair from message, returns None if not found"""
                 # Get the latest subscription_indices from the UDP manager
                 subscription_indices = self.udp_manager.subscription_indices
                 # Extract index from the message
@@ -531,7 +506,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 return trading_pair
 
             async def _setup_qtx_udp_subscriptions(self):
-                """Setup UDP subscriptions for QTX market data with specialized handlers"""
+                """Sets up UDP subscriptions with specialized message handlers"""
                 # Note: We don't need to reinitialize trading_pairs - use the ones from the parent connector
                 # Start UDP listener
                 await self.udp_manager.start_listening()
@@ -563,7 +538,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         success, subscribed_pairs = await self.udp_manager.subscribe_to_trading_pairs([trading_pair])
                         # After subscription, get updated subscription indices
                         self._subscription_indices = self.udp_manager.subscription_indices
-                        self.logger().info(
+                        self.logger().debug(
                             f"Subscribed to QTX UDP market data for {qtx_symbol} (mapped to {trading_pair})"
                         )
                         # Debug log the subscription indices
@@ -572,17 +547,16 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         self.logger().error(f"Error subscribing to QTX UDP for {trading_pair}: {e}")
 
             async def _listen_for_qtx_order_book_diffs(self, output: asyncio.Queue):
-                """Listen for orderbook diffs from QTX UDP"""
+                """Forwards order book diff messages to output queue"""
                 messages_processed = 0
                 while True:
                     try:
                         message = await self._message_queue["diffs"].get()
                         messages_processed += 1
-                        # Periodic logging to verify message flow
-                        if messages_processed % 100 == 0:
+                        # Log only very infrequently to reduce verbosity
+                        if messages_processed % 10000 == 0:
                             self.logger().debug(
-                                f"Processed {messages_processed} diff messages, "
-                                f"update_id={message.update_id}, trading_pair={message.trading_pair}"
+                                f"Processed {messages_processed} diff messages"
                             )
                         output.put_nowait(message)
                     except asyncio.CancelledError:
@@ -592,7 +566,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         await asyncio.sleep(1.0)
 
             async def _listen_for_qtx_order_book_snapshots(self, output: asyncio.Queue):
-                """Listen for orderbook snapshots from QTX UDP"""
+                """Forwards order book snapshot messages to output queue"""
                 while True:
                     try:
                         message = await self._message_queue["snapshots"].get()
@@ -604,7 +578,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         await asyncio.sleep(1.0)
 
             async def _listen_for_qtx_trades(self, output: asyncio.Queue):
-                """Listen for trades from QTX UDP"""
+                """Forwards trade messages to output queue"""
                 while True:
                     try:
                         message = await self._message_queue["trades"].get()
@@ -657,7 +631,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     )
 
             async def start_network(self):
-                """Override to manage QTX-specific network operations."""
+                """Initializes QTX UDP connection and subscriptions"""
                 await super().start_network()
                 # Initialize UDP manager connections
                 if hasattr(self, "_order_book_tracker") and self._order_book_tracker is not None:
@@ -667,7 +641,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         await data_source.listen_for_subscriptions()
 
             async def stop_network(self):
-                """Stop network connections and clean up resources."""
+                """Stops UDP and shared memory connections"""
                 # Stop parent network components first
                 try:
                     await super().stop_network()
@@ -681,10 +655,10 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             hasattr(self.udp_manager, "_listening_task")
                             and self.udp_manager._listening_task is not None
                         ):
-                            self.logger().info("Stopping UDP listener")
+                            self.logger().debug("Stopping UDP listener")
                             await self.udp_manager.stop_listening()
                         # No close() method - stop_listening() handles socket cleanup
-                        self.logger().info("UDP manager stopped successfully")
+                        self.logger().debug("UDP manager stopped successfully")
                     except Exception as e:
                         self.logger().error(f"Error stopping UDP manager: {e}", exc_info=True)
                     finally:
@@ -694,7 +668,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                     try:
                         # Use disconnect() method, not cleanup()
                         await self.shm_manager.disconnect()
-                        self.logger().info("Shared memory manager disconnected successfully")
+                        self.logger().debug("Shared memory manager disconnected successfully")
                     except Exception as e:
                         self.logger().error(f"Error disconnecting shared memory manager: {e}", exc_info=True)
                     finally:

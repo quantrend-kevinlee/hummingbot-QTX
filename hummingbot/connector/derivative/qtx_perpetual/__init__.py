@@ -1,0 +1,1 @@
+# QTX Perpetual connector for Hummingbot

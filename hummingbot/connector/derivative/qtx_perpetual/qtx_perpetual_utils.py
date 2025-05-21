@@ -8,6 +8,7 @@ from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_constants as CONSTANTS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
+# Fee structure
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.0002"),
     taker_percent_fee_decimal=Decimal("0.0004"),
@@ -15,13 +16,13 @@ DEFAULT_FEES = TradeFeeSchema(
 )
 
 CENTRALIZED = True
-
 EXAMPLE_PAIR = "BTC-USDT"
-
 BROKER_ID = "QTX_Perpetual"
 
 
 class QtxPerpetualConfigMap(BaseConnectorConfigMap):
+    """Configuration parameters for QTX Perpetual connector"""
+    
     connector: str = "qtx_perpetual"
     exchange_backend: str = Field(
         default="binance",

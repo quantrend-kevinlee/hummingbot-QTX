@@ -98,12 +98,12 @@ class QtxPerpetualUDPManager:
         :return: True when connection is successful
         :raises: ConnectionError if connection fails
         """
-        # Generate unique connection ID for better debugging
-        connection_id = f"conn_{int(time.time())}"
+        # Only log basic connection info at DEBUG level
         self.logger().debug(
-            f"[{connection_id}] Connect called - is_connected={self._is_connected}, "
-            f"has_socket={self._udp_socket is not None}, "
-            f"subscribed_pairs={len(self._subscribed_pairs)}"
+            "Connect called - is_connected=%s, has_socket=%s, subscribed_pairs=%d",
+            self._is_connected, 
+            self._udp_socket is not None,
+            len(self._subscribed_pairs)
         )
 
         # Check if we're already connected - avoid redundant reconnections
@@ -112,13 +112,13 @@ class QtxPerpetualUDPManager:
                 # If we have active subscriptions, don't ping - we could confuse the socket buffer
                 if self._subscribed_pairs:
                     self.logger().debug(
-                        f"[{connection_id}] UDP connection already active with {len(self._subscribed_pairs)} "
-                        f"subscriptions, skipping ping check"
+                        "UDP connection already active with %d subscriptions, skipping ping check",
+                        len(self._subscribed_pairs)
                     )
                     return True
 
                 # Verify connection is still active with a quick ping
-                self.logger().debug(f"[{connection_id}] Testing UDP connection with ping")
+                self.logger().debug("Testing UDP connection with ping")
                 self._udp_socket.settimeout(2.0)  # Short timeout for check
                 self._udp_socket.sendto(b"ping", (self._host, self._port))
 
@@ -128,29 +128,26 @@ class QtxPerpetualUDPManager:
                     ready_to_read, _, _ = select.select([self._udp_socket], [], [], 1.0)
                     if ready_to_read:
                         pong_response, addr = self._udp_socket.recvfrom(self._buffer_size)
-                        self.logger().debug(
-                            f"[{connection_id}] Cleared ping response from socket buffer: "
-                            f"{pong_response!r} from {addr}"
-                        )
+                        self.logger().debug("Cleared ping response from socket buffer")
                 except Exception as e:
-                    self.logger().debug(f"[{connection_id}] No ping response or error receiving it: {e}")
+                    self.logger().debug("No ping response or error receiving it: %s", e)
 
-                self.logger().debug(f"[{connection_id}] UDP connection verified to {self._host}:{self._port}")
+                self.logger().debug("UDP connection verified to %s:%d", self._host, self._port)
                 return True
             except (socket.timeout, OSError) as e:
                 # Connection is stale, proceed with reconnection
-                self.logger().info(f"[{connection_id}] Existing connection is stale: {e}. Reconnecting...")
+                self.logger().info("Existing connection is stale: %s. Reconnecting...", e)
                 self._close_socket()
             except Exception as e:
                 # Any other error, proceed with reconnection
                 self.logger().warning(
-                    f"[{connection_id}] Error checking existing connection: {e}. Recreating socket..."
+                    "Error checking existing connection: %s. Recreating socket...", e
                 )
                 self._close_socket()
         elif self._is_connected:
             # Connected flag is set but socket is None (inconsistent state)
             self.logger().warning(
-                f"[{connection_id}] Connected flag is set but socket is None. Fixing inconsistent state..."
+                "Connected flag is set but socket is None. Fixing inconsistent state..."
             )
             self._is_connected = False
 
@@ -165,11 +162,11 @@ class QtxPerpetualUDPManager:
 
             # Bind to any address on an automatic port for receiving data
             self._udp_socket.bind(("0.0.0.0", 0))
-            self.logger().debug(f"[{connection_id}] Created new UDP socket, bound to 0.0.0.0:0")
+            self.logger().debug("Created new UDP socket, bound to 0.0.0.0:0")
 
             # Ping the server to check connection
             self._udp_socket.settimeout(2.0)
-            self.logger().debug(f"[{connection_id}] Sending ping to test connection")
+            self.logger().debug("Sending ping to test connection")
 
             try:
                 # Send ping and track send time for correlation with response
@@ -198,7 +195,7 @@ class QtxPerpetualUDPManager:
                                 if not ready_to_read:
                                     # If still no data, likely no response coming
                                     self.logger().debug(
-                                        f"[{connection_id}] No ping response after 1 second, assuming no response"
+                                        "No ping response after 1 second, assuming no response"
                                     )
                                     break
 
@@ -219,8 +216,7 @@ class QtxPerpetualUDPManager:
 
                         if is_likely_ack:
                             self.logger().debug(
-                                f"[{connection_id}] Received what looks like an ACK during ping test: "
-                                f"{pong_response!r} - treating as confirmation of connection"
+                                "Received ACK-like message during ping test - treating as connection confirmation"
                             )
                             # Put it back (not possible with UDP) or remember it for later processing
                             # For now, just break and assume we got the "pong" even though it's an ACK
@@ -228,22 +224,23 @@ class QtxPerpetualUDPManager:
                             break
                         else:
                             self.logger().debug(
-                                f"[{connection_id}] Drained message from socket buffer: "
-                                f"{pong_response!r} from {addr}, latency: {latency_ms}ms"
+                                "Drained message from socket buffer, latency: %dms", 
+                                latency_ms
                             )
                             pong_received = True
 
                     except socket.timeout:
                         # If we time out and already got a pong, that's fine
                         if pong_received:
-                            self.logger().debug(f"[{connection_id}] Socket drained, no more messages")
+                            self.logger().debug("Socket drained, no more messages")
                         else:
                             self.logger().debug(
-                                f"[{connection_id}] Timeout waiting for ping response (attempt {drain_attempts})"
+                                "Timeout waiting for ping response (attempt %d)", 
+                                drain_attempts
                             )
                         break
                     except Exception as e:
-                        self.logger().debug(f"[{connection_id}] Error receiving ping response: {e}")
+                        self.logger().debug("Error receiving ping response: %s", e)
                         # If we already got at least one response, assume socket is working
                         if pong_received:
                             break
@@ -255,9 +252,9 @@ class QtxPerpetualUDPManager:
                 # Most QTX servers don't respond to pings with pongs, but the send not failing is enough
                 self._is_connected = True
                 self._connection_start_time = time.time()
-                self.logger().info(
-                    f"[{connection_id}] UDP connection established to {self._host}:{self._port}, "
-                    f"received pong: {pong_received}"
+                self.logger().debug(
+                    "UDP connection established to %s:%d",
+                    self._host, self._port
                 )
 
                 # Reset subscription tracking when creating a new connection
@@ -270,11 +267,11 @@ class QtxPerpetualUDPManager:
                 return True
             except (socket.timeout, ConnectionRefusedError) as e:
                 self._close_socket()
-                raise ConnectionError(f"[{connection_id}] Failed to connect to UDP server: {e}")
+                raise ConnectionError(f"Failed to connect to UDP server: {e}")
 
         except Exception as e:
             self._close_socket()
-            raise ConnectionError(f"[{connection_id}] Error establishing UDP connection: {e}")
+            raise ConnectionError(f"Error establishing UDP connection: {e}")
 
     def _close_socket(self):
         """Close the UDP socket safely"""
@@ -295,14 +292,14 @@ class QtxPerpetualUDPManager:
 
                 # Close the socket
                 self._udp_socket.close()
-                self.logger().info("UDP socket closed successfully")
+                self.logger().debug("UDP socket closed successfully")
             except Exception as e:
                 self.logger().error(f"Error closing UDP socket: {e}", exc_info=True)
             finally:
                 # Ensure the socket is set to None and connection flag is reset
                 self._udp_socket = None
                 self._is_connected = False
-                self.logger().info("UDP socket reference cleared")
+                self.logger().debug("UDP socket reference cleared")
 
     # ---------------------------------------- End of Connection Management ----------------------------------------
 
@@ -324,23 +321,24 @@ class QtxPerpetualUDPManager:
         # Only log already subscribed pairs at debug level
         if already_subscribed:
             self.logger().debug(
-                f"[{subscription_id}] Skipping {len(already_subscribed)} already subscribed pairs: {already_subscribed}"
+                "Skipping %d already subscribed pairs",
+                len(already_subscribed)
             )
 
         if not new_pairs:
             self.logger().debug(
-                f"[{subscription_id}] No new pairs to subscribe to, all requested pairs already subscribed"
+                "No new pairs to subscribe to, all requested pairs already subscribed"
             )
             return True, already_subscribed
 
-        self.logger().debug(f"[{subscription_id}] Will attempt to subscribe to {len(new_pairs)} new pairs: {new_pairs}")
+        self.logger().debug("Will attempt to subscribe to %d new pairs", len(new_pairs))
 
         # Make sure we're connected
         if not self._is_connected or self._udp_socket is None:
-            self.logger().info(f"[{subscription_id}] No active connection for subscription, attempting to connect...")
+            self.logger().debug("No active connection for subscription, attempting to connect...")
             success = await self.connect()
             if not success:
-                self.logger().error(f"[{subscription_id}] Failed to establish connection for subscription")
+                self.logger().error("Failed to establish connection for subscription")
                 return len(already_subscribed) > 0, already_subscribed
 
         # Set socket to blocking mode for subscription phase
@@ -375,7 +373,7 @@ class QtxPerpetualUDPManager:
         # Subscribe to remaining trading pairs
         for exchange_symbol, trading_pair in exchange_symbols_to_pairs.items():
             try:
-                self.logger().info(
+                self.logger().debug(
                     f"[{subscription_id}] Subscribing to QTX UDP feed: {exchange_symbol} for {trading_pair}"
                 )
                 subscription_attempts.append(trading_pair)
@@ -415,7 +413,7 @@ class QtxPerpetualUDPManager:
                     # try to parse out a simple integer ACK
                     try:
                         index = int(response.decode("utf-8").strip())
-                        self.logger().info(f"[{subscription_id}] Got subscription ACK {index} for {exchange_symbol}")
+                        self.logger().debug(f"[{subscription_id}] Got subscription ACK {index} for {exchange_symbol}")
                         break
                     except (UnicodeDecodeError, ValueError):
                         # Try to determine if this is a market data message
@@ -425,15 +423,15 @@ class QtxPerpetualUDPManager:
                                     "<iiqqqq", response[:40]
                                 )
                                 self.logger().debug(
-                                    f"[{subscription_id}] Got market data during ACK-wait: type={msg_type}, index={idx}"
+                                    f"Got market data during ACK-wait: type={msg_type}, index={idx}"
                                 )
                             except struct.error:
                                 self.logger().debug(
-                                    f"[{subscription_id}] Failed to parse header from non-text message: {response.hex()[:80]}..."
+                                    f"Failed to parse header from non-text message: {response.hex()[:80]}..."
                                 )
                         else:
                             self.logger().debug(
-                                f"[{subscription_id}] Not a valid subscription response: {response!r} (hex: {response.hex()})"
+                                f"Not a valid subscription response: {response!r} (hex: {response.hex()})"
                             )
                         continue
 
@@ -833,21 +831,21 @@ class QtxPerpetualUDPManager:
 
         # Create new listening task
         self._listening_task = asyncio.create_task(self._listen_for_messages())
-        self.logger().info("Started UDP message listener")
+        self.logger().debug("Started UDP message listener")
 
     async def stop_listening(self):
         """Stop the listening task and clean up resources"""
-        self.logger().info("Beginning UDP listener shutdown sequence")
+        self.logger().debug("Beginning UDP listener shutdown sequence")
 
         # Cancel the listening task to prevent processing of new messages
         if self._listening_task is not None and not self._listening_task.done():
-            self.logger().info("Cancelling UDP listener task")
+            self.logger().debug("Cancelling UDP listener task")
             self._listening_task.cancel()
             try:
                 await self._listening_task
-                self.logger().info("UDP listener task cancelled successfully")
+                self.logger().debug("UDP listener task cancelled successfully")
             except asyncio.CancelledError:
-                self.logger().info("UDP listener task cancelled")
+                self.logger().debug("UDP listener task cancelled")
             except Exception as e:
                 self.logger().error(f"Error while cancelling UDP listener task: {e}", exc_info=True)
             finally:
@@ -856,7 +854,7 @@ class QtxPerpetualUDPManager:
         # Stop any continuous data collections
         if hasattr(self, "_continuous_collections") and self._continuous_collections:
             try:
-                self.logger().info("Stopping continuous data collections")
+                self.logger().debug("Stopping continuous data collections")
                 await self.stop_all_continuous_collections()
             except Exception as e:
                 self.logger().error(f"Error stopping continuous collections: {e}", exc_info=True)
@@ -864,7 +862,7 @@ class QtxPerpetualUDPManager:
         # Unsubscribe from all pairs
         if self._subscribed_pairs:
             try:
-                self.logger().info(f"Unsubscribing from {len(self._subscribed_pairs)} pairs")
+                self.logger().debug(f"Unsubscribing from {len(self._subscribed_pairs)} pairs")
                 await self.unsubscribe_from_all()
 
                 # Add a small delay to allow unsubscribe messages to be processed
@@ -890,7 +888,7 @@ class QtxPerpetualUDPManager:
         # Ensure the connected flag is reset
         self._is_connected = False
 
-        self.logger().info("Stopped UDP message listener completely")
+        self.logger().debug("Stopped UDP message listener completely")
 
     # ---------------------------------------- End of Lifecycle Management ----------------------------------------
 
@@ -902,7 +900,7 @@ class QtxPerpetualUDPManager:
         Main listening loop for incoming UDP messages
         Processes and dispatches messages to registered callbacks
         """
-        self.logger().info("Starting to listen for messages from QTX UDP feed")
+        self.logger().debug("Starting to listen for messages from QTX UDP feed")
         recv_buffer = bytearray(self._buffer_size)
         self._receive_count = 0
         self._last_stats_time = time.time()
@@ -927,9 +925,9 @@ class QtxPerpetualUDPManager:
                         if not success:
                             continue
 
-                    # Check if we should log statistics (every 60 seconds)
+                    # Check if we should log statistics (every 5 minutes instead of every minute)
                     current_time = time.time()
-                    if current_time - self._last_stats_time >= 60:
+                    if current_time - self._last_stats_time >= 300:  # 5 minutes
                         self._log_statistics()
                         self._last_stats_time = current_time
 
@@ -982,8 +980,8 @@ class QtxPerpetualUDPManager:
                     data = recv_buffer[:bytes_read]
                     self._receive_count += 1
 
-                    # Log message count periodically - but only at debug level and at more significant milestones
-                    if self._receive_count % 10000 == 0 and self.logger().isEnabledFor(logging.DEBUG):
+                    # Only log message count at major milestones
+                    if self._receive_count % 100000 == 0 and self.logger().isEnabledFor(logging.DEBUG):
                         self.logger().debug(f"Received {self._receive_count} total UDP messages")
 
                     if len(data) >= 40:  # Minimum header size
@@ -996,22 +994,22 @@ class QtxPerpetualUDPManager:
 
                 except asyncio.CancelledError:
                     is_cancelling = True
-                    self.logger().info("UDP listener task cancellation detected")
+                    self.logger().debug("UDP listener task cancellation detected")
                     break
                 except Exception as e:
                     self.logger().error(f"Error processing UDP message: {e}", exc_info=True)
                     await asyncio.sleep(0.1)
 
         except asyncio.CancelledError:
-            self.logger().info("UDP listener task cancelled from outer loop")
+            self.logger().debug("UDP listener task cancelled from outer loop")
             # No need to re-raise, just exit cleanly
         except Exception as e:
             self.logger().error(f"Unexpected error in UDP listener: {e}", exc_info=True)
         finally:
-            self.logger().info("UDP listener task exiting")
+            self.logger().debug("UDP listener task exiting")
             # Cleanup on exit if not already done
             if self._udp_socket is not None:
-                self.logger().info("Cleaning up socket from listener task")
+                self.logger().debug("Cleaning up socket from listener task")
                 self._close_socket()
 
     # ---------------------------------------- End of Message Listening ----------------------------------------
@@ -1181,7 +1179,7 @@ class QtxPerpetualUDPManager:
             # If this is the first real data, mark the order book as no longer empty
             if is_empty:
                 self._empty_orderbook[trading_pair] = False
-                self.logger().info(
+                self.logger().debug(
                     f"Received first depth data for {trading_pair}: asks: {len(asks)}, bids: {len(bids)}"
                 )
 
@@ -1270,7 +1268,7 @@ class QtxPerpetualUDPManager:
 
         # Check if we need to subscribe to this trading pair
         if trading_pair not in self._subscribed_pairs:
-            self.logger().info(f"[{operation_id}] Trading pair {trading_pair} not subscribed, subscribing now")
+            self.logger().debug(f"[{operation_id}] Trading pair {trading_pair} not subscribed, subscribing now")
             success, _ = await self.subscribe_to_trading_pairs([trading_pair])
             if not success:
                 self.logger().error(f"[{operation_id}] Failed to subscribe to {trading_pair}, returning empty data")
@@ -1468,17 +1466,25 @@ class QtxPerpetualUDPManager:
             hours, remainder = divmod(elapsed, 3600)
             minutes, seconds = divmod(remainder, 60)
 
-            # Log only total message count at INFO level
-            self.logger().info(
+            # Log only total message count, but at DEBUG level instead of INFO
+            self.logger().debug(
                 f"UDP Stats: Connected for {int(hours)}h {int(minutes)}m {int(seconds)}s, "
                 f"received {self._receive_count} total UDP messages"
             )
 
-            # Log detailed per-symbol statistics only at DEBUG level
+            # Log detailed per-symbol stats only for high-volume symbols and at DEBUG level
             if self.logger().isEnabledFor(logging.DEBUG):
-                for symbol, count in sorted(self._symbol_message_counts.items(), key=lambda x: x[1], reverse=True):
-                    if not symbol.startswith("UNKNOWN_IDX_"):
-                        self.logger().debug(f"  {symbol}: {count} messages")
+                # Only log top 5 most active symbols to reduce verbosity
+                top_symbols = sorted(
+                    [(s, c) for s, c in self._symbol_message_counts.items() if not s.startswith("UNKNOWN_IDX_")],
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:5]
+                
+                if top_symbols:
+                    for symbol, count in top_symbols:
+                        if count > 0:  # Only log if there were messages
+                            self.logger().debug(f"  {symbol}: {count} messages")
 
             # Reset counters for next period
             for symbol in self._symbol_message_counts:

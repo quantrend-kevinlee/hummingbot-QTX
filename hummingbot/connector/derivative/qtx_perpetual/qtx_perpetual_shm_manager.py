@@ -1,7 +1,7 @@
 import asyncio
-import logging
 import ctypes
 import gc
+import logging
 import math
 import mmap
 import re
@@ -182,7 +182,7 @@ class QtxPerpetualSharedMemoryManager:
             # Cast the mapped memory to our Queue structure pointer
             self._queue_ptr = Queue.from_buffer(self._memory_map)
 
-            self.logger().info(f"Connected to QTX order manager via shared memory '{self._shm_name}'")
+            self.logger().debug(f"Connected to QTX order manager via shared memory '{self._shm_name}'")
 
             self._is_connected = True
             self._last_connection_error = None
@@ -237,14 +237,14 @@ class QtxPerpetualSharedMemoryManager:
             self._shm = None
 
         self._is_connected = False
-        self.logger().info("Shared memory resources cleaned up")
+        self.logger().debug("Shared memory resources cleaned up")
 
     async def disconnect(self):
         """Disconnect from shared memory and cleanup resources"""
         if not self._is_connected:
             return
 
-        self.logger().info("Disconnecting from shared memory")
+        self.logger().debug("Disconnecting from shared memory")
 
         # Clean up resources
         self._cleanup_resources()
@@ -253,7 +253,7 @@ class QtxPerpetualSharedMemoryManager:
         self._api_key_initialized = False
         self._pending_orders = {}
 
-        self.logger().info("Disconnected from shared memory successfully")
+        self.logger().debug("Disconnected from shared memory successfully")
 
     # --- API Key Management ---
 
@@ -298,7 +298,7 @@ class QtxPerpetualSharedMemoryManager:
             key_order_ref.api_key = self._api_key.encode("utf-8")
             key_order_ref.api_secret = self._api_secret.encode("utf-8")
 
-            self.logger().info("Sending API key initialization request")
+            self.logger().debug("Sending API key initialization request")
 
             # Notify the order manager by incrementing the queue's to_idx
             self._queue_ptr.to_idx = (self._queue_ptr.to_idx + 1) % MAX_QUEUE_SIZE
@@ -320,7 +320,7 @@ class QtxPerpetualSharedMemoryManager:
 
                 # Process response once received - just log it but don't try to parse
                 response = key_order_ref.res_msg.decode(errors="ignore")
-                self.logger().info(f"API Key initialization response received: {response}")
+                self.logger().debug(f"API Key initialization response received: {response}")
 
                 # Reference client doesn't parse the response content - it just assumes success if res_ts_ns is set
                 # We'll follow the same approach for maximum compatibility
@@ -447,7 +447,7 @@ class QtxPerpetualSharedMemoryManager:
             # Store reference to the order for tracking, if needed
             self._pending_orders[client_order_id] = place_order_ref
 
-            self.logger().info(f"Placing order: {symbol}, size={size}, client_order_id={client_order_id}")
+            self.logger().debug(f"Placing order: {symbol}, size={size}, client_order_id={client_order_id}")
 
             # Notify the order manager by incrementing the queue's to_idx
             self._queue_ptr.to_idx = (self._queue_ptr.to_idx + 1) % MAX_QUEUE_SIZE
@@ -469,13 +469,13 @@ class QtxPerpetualSharedMemoryManager:
 
                 # Get response data once received
                 response = place_order_ref.res_msg.decode(errors="ignore")
-                self.logger().info(f"Order placement response received for {client_order_id}: {response}")
+                self.logger().debug(f"Order placement response received for {client_order_id}: {response}")
 
                 # Parse response to determine success and extract info
                 success, response_data = self._parse_order_response(response, client_order_id)
 
                 if success:
-                    self.logger().info(f"Order placed successfully: {client_order_id} - {response_data}")
+                    self.logger().debug(f"Order placed successfully: {client_order_id} - {response_data}")
                 else:
                     self.logger().error(f"Order placement failed: {client_order_id} - {response_data}")
 
@@ -559,7 +559,7 @@ class QtxPerpetualSharedMemoryManager:
             # Store reference to the cancel request for tracking, if needed
             self._pending_orders[cancel_track_id] = cancel_order_ref
 
-            self.logger().info(f"Canceling order with client ID: {client_order_id} for symbol: {symbol}")
+            self.logger().debug(f"Canceling order with client ID: {client_order_id} for symbol: {symbol}")
 
             # Notify the order manager by incrementing the queue's to_idx
             self._queue_ptr.to_idx = (self._queue_ptr.to_idx + 1) % MAX_QUEUE_SIZE
@@ -581,13 +581,13 @@ class QtxPerpetualSharedMemoryManager:
 
                 # Get response data once received
                 response = cancel_order_ref.res_msg.decode(errors="ignore")
-                self.logger().info(f"Order cancellation response received for {client_order_id}: {response}")
+                self.logger().debug(f"Order cancellation response received for {client_order_id}: {response}")
 
                 # Parse response to determine success and extract info
                 success, response_data = self._parse_cancel_response(response, client_order_id)
 
                 if success:
-                    self.logger().info(f"Order cancelled successfully: {client_order_id} - {response_data}")
+                    self.logger().debug(f"Order cancelled successfully: {client_order_id} - {response_data}")
                 else:
                     self.logger().error(f"Order cancellation failed: {client_order_id} - {response_data}")
 
