@@ -216,39 +216,23 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 if self.shm_manager is not None:
                     # Use QTX shared memory for order placement
                     try:
-                        # Track the order before placing
-                        # We start tracking order with initial state OPEN to ensure it's properly tracked
-                        # This helps with order status management when order is filled
-                        from hummingbot.core.data_type.in_flight_order import OrderState
-
-                        self.start_tracking_order(
-                            order_id=order_id,
-                            exchange_order_id=None,
-                            trading_pair=trading_pair,
-                            trade_type=trade_type,
-                            price=price,
-                            amount=amount,
-                            order_type=order_type,
-                            position_action=position_action,
-                            initial_state=OrderState.OPEN,
-                        )
-
                         # Convert to exchange format for placing order
                         # First check if symbols mapping is ready
                         if not super().trading_pair_symbol_map_ready():
                             self.logger().warning(
                                 f"Symbol mapping not ready yet. Will retry order placement for {trading_pair}"
                             )
-                            # Cancel the order and retry later
-                            self.stop_tracking_order(order_id)
                             raise Exception("Trading pair symbol map not ready")
+                        
                         # Use the parent exchange's method to convert from Hummingbot to exchange format
                         exchange_pair = await super().exchange_symbol_associated_to_pair(trading_pair)
                         self.logger().info(
                             f"Order placement: Converting {trading_pair} to exchange format: {exchange_pair}"
                         )
+                        
                         # Convert parameters to expected types for shared memory
                         side_int = 1 if trade_type == TradeType.BUY else -1
+                        
                         # Determine position side based on position action and trade type
                         # For HEDGE mode: LONG positions use BUY orders, SHORT positions use SELL orders
                         if position_action == PositionAction.OPEN:
@@ -268,6 +252,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                                 position_side_int = 1  # LONG
                             else:
                                 position_side_int = 2  # SHORT
+                                
                         # Map order types to shared memory format
                         order_type_map = {
                             OrderType.LIMIT: 2,  # GTC
@@ -276,6 +261,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                         }
                         order_type_int = order_type_map.get(order_type, 2)  # Default to GTC
 
+                        # Place the order using shared memory
                         success, result = await self.shm_manager.place_order(
                             client_order_id=order_id,
                             symbol=exchange_pair,
@@ -286,26 +272,23 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             size=amount,
                             price_match=0,  # NONE for now
                         )
+                        
                         if not success:
                             error_msg = result.get("error", "Unknown error placing order via shared memory")
                             self.logger().error(f"Failed to place order via QTX shared memory: {error_msg}")
                             raise Exception(error_msg)
+
+                        # Get processed results from SHM manager
                         exchange_order_id = result.get("exchange_order_id", order_id)
                         transaction_time = result.get("transaction_time", self.current_timestamp)
+                        
                         self.logger().info(
                             f"Order placed via shared memory - Client ID: {order_id}, Exchange ID: {exchange_order_id}"
                         )
 
-                        # Fetch and update the tracked order
-                        tracked_order = self._order_tracker.fetch_order(client_order_id=order_id)
-                        if tracked_order:
-                            tracked_order.exchange_order_id = exchange_order_id
-                        else:
-                            self.logger().warning(f"Tracked order {order_id} not found after placement")
                         return exchange_order_id, transaction_time
                     except Exception as e:
                         self.logger().error(f"Error placing order via QTX shared memory: {e}", exc_info=True)
-                        self.stop_tracking_order(order_id)
                         raise
                 else:
                     raise Exception("QTX shared memory manager is not initialized. Order placement failed.")

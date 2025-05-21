@@ -50,6 +50,7 @@ class QTXTestStrategy(ScriptStrategyBase):
     # Distant limit order tracking
     placed_distant_order = False
     distant_order_id = None
+    distant_order_timestamp = None
     test_complete = False
 
     # Position tracking
@@ -97,8 +98,19 @@ class QTXTestStrategy(ScriptStrategyBase):
             self.place_distant_limit_order()
             return
 
-        # After distant order is placed, log positions and complete test
-        if self.placed_distant_order and not self.test_complete:
+        # Check if distant order needs to be canceled (after 5 seconds)
+        if (self.placed_distant_order and self.distant_order_id is not None and 
+                not self.test_complete and self.distant_order_timestamp is not None):
+            # Check if order is older than 5 seconds
+            if current_time - self.distant_order_timestamp > 5:
+                self.log_with_clock(logging.INFO, f"Canceling distant order {self.distant_order_id} after 5 seconds")
+                connector = self.connectors[self.connector_name]
+                connector.cancel(self.trading_pair, self.distant_order_id)
+                # We'll wait for the cancel confirmation in did_cancel_order before completing the test
+                return
+                
+        # After distant order is placed and either canceled or test completed
+        if self.placed_distant_order and not self.test_complete and self.distant_order_id is None:
             self.log_positions_status()
             self.log_with_clock(logging.INFO, "QTX test complete! Distant order placed and position opened.")
             self.test_complete = True
@@ -180,6 +192,7 @@ class QTXTestStrategy(ScriptStrategyBase):
 
             self.distant_order_id = order_id
             self.placed_distant_order = True
+            self.distant_order_timestamp = time.time()
             self.last_action_timestamp = time.time()
             self.log_with_clock(logging.INFO, f"Placed distant limit order with ID: {order_id}")
         except Exception as e:
@@ -227,6 +240,11 @@ class QTXTestStrategy(ScriptStrategyBase):
         msg = f"Cancelled order {event.order_id}"
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
+        
+        # Check if this is our distant order
+        if event.order_id == self.distant_order_id:
+            self.log_with_clock(logging.INFO, "Distant limit order was cancelled after timeout.")
+            self.distant_order_id = None  # Clear the order ID to indicate it's been cancelled
 
     def did_expire_order(self, event: OrderExpiredEvent):
         msg = f"Order {event.order_id} expired"

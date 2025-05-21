@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import ctypes
 import gc
 import math
@@ -105,9 +106,7 @@ class QtxPerpetualSharedMemoryManager:
     @classmethod
     def logger(cls) -> HummingbotLogger:
         if cls._logger is None:
-            from hummingbot.logger import HummingbotLogger
-
-            cls._logger = HummingbotLogger(__name__)
+            cls._logger = logging.getLogger(__name__)
         return cls._logger
 
     @property
@@ -470,7 +469,7 @@ class QtxPerpetualSharedMemoryManager:
 
                 # Get response data once received
                 response = place_order_ref.res_msg.decode(errors="ignore")
-                self.logger().debug(f"Order placement response received for {client_order_id}: {response}")
+                self.logger().info(f"Order placement response received for {client_order_id}: {response}")
 
                 # Parse response to determine success and extract info
                 success, response_data = self._parse_order_response(response, client_order_id)
@@ -582,7 +581,7 @@ class QtxPerpetualSharedMemoryManager:
 
                 # Get response data once received
                 response = cancel_order_ref.res_msg.decode(errors="ignore")
-                self.logger().debug(f"Order cancellation response received for {client_order_id}: {response}")
+                self.logger().info(f"Order cancellation response received for {client_order_id}: {response}")
 
                 # Parse response to determine success and extract info
                 success, response_data = self._parse_cancel_response(response, client_order_id)
@@ -619,96 +618,175 @@ class QtxPerpetualSharedMemoryManager:
         response_data = {"raw_response": response, "client_order_id": client_order_id}
         success: bool
 
-        # Check for success indicators in the response
-        if "success" in response.lower() or "executed" in response.lower():
-            success = True
+        # Try to parse the response as JSON first, as the binance-futures response is in JSON format
+        try:
+            import json
 
-            # Extract exchange order ID if present
-            # The exact format depends on the QTX response format
-            exchange_id_match = re.search(r"order_id[\":\s]+([0-9a-zA-Z]+)", response)
-            if exchange_id_match:
-                response_data["exchange_order_id"] = exchange_id_match.group(1)
+            json_response = json.loads(response)
+            # Check for success (200 status code)
+            if isinstance(json_response, dict) and json_response.get("status") == 200 and "result" in json_response:
+                success = True
+                result = json_response["result"]
+
+                # Extract exchange order ID (orderId field in Binance response)
+                if "orderId" in result:
+                    response_data["exchange_order_id"] = str(result["orderId"])
+                else:
+                    # If no exchange order ID found, use client_order_id as fallback
+                    response_data["exchange_order_id"] = client_order_id
+                    self.logger().warning(
+                        f"Could not extract exchange order ID from response for {client_order_id}. "
+                        f"Using client_order_id as fallback."
+                    )
+
+                # Extract order status
+                if "status" in result:
+                    response_data["status"] = result["status"]
+                else:
+                    # Default to NEW status if not found
+                    response_data["status"] = "NEW"
+
+                # Extract symbol/trading pair
+                if "symbol" in result:
+                    response_data["symbol"] = result["symbol"]
+
+                # Extract price
+                if "price" in result:
+                    response_data["price"] = result["price"]
+
+                # Extract executed quantity (for filled orders)
+                if "executedQty" in result:
+                    response_data["executed_qty"] = result["executedQty"]
+
+                # Extract timestamp - look for updateTime or time
+                if "updateTime" in result:
+                    # Convert to seconds if in milliseconds
+                    timestamp = result["updateTime"]
+                    if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                        timestamp = timestamp / 1000
+                    response_data["transaction_time"] = timestamp
+                elif "time" in result:
+                    timestamp = result["time"]
+                    if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                        timestamp = timestamp / 1000
+                    response_data["transaction_time"] = timestamp
+                else:
+                    # Use current time if not found
+                    response_data["transaction_time"] = time.time()
+
+                return success, response_data
             else:
-                # If no exchange order ID is found, generate a deterministic one based on client order ID
-                # Using a prefix to identify it as QTX-generated
-                response_data["exchange_order_id"] = f"qtx_{abs(hash(client_order_id))}"
-                self.logger().warning(
-                    f"Could not extract exchange order ID from response for {client_order_id}. "
-                    f"Using generated ID: {response_data['exchange_order_id']}"
-                )
+                # JSON parsing worked but response indicates failure
+                success = False
+                error_msg = "Unknown error"
 
-            # Extract order status if present
-            status_match = re.search(r"status[\":\s]+([a-zA-Z_]+)", response)
-            if status_match:
-                response_data["status"] = status_match.group(1)
+                # Extract error message if present
+                if "error" in json_response:
+                    error_msg = json_response.get("error", "Unknown error")
+                elif "msg" in json_response:
+                    error_msg = json_response.get("msg", "Unknown error")
+
+                # Extract error code if present
+                if "code" in json_response:
+                    response_data["error_code"] = json_response["code"]
+
+                response_data["error"] = error_msg
+                return success, response_data
+
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # If JSON parsing failed, fall back to regex-based parsing
+            # This is the original behavior for non-JSON responses
+
+            # Check for success indicators in the response
+            if "success" in response.lower() or "executed" in response.lower():
+                success = True
+
+                # Extract exchange order ID if present
+                # Try multiple patterns for different exchange formats
+                exchange_id_match = re.search(r"order[iI]d[\":\s]+([0-9a-zA-Z]+)", response)
+                if exchange_id_match:
+                    # Use the exact exchange order ID without adding any prefix
+                    response_data["exchange_order_id"] = exchange_id_match.group(1)
+                else:
+                    # If no exchange order ID is found, use client_order_id as fallback without any prefix
+                    response_data["exchange_order_id"] = client_order_id
+                    self.logger().warning(
+                        f"Could not extract exchange order ID from response for {client_order_id}. "
+                        f"Using client_order_id as fallback."
+                    )
+
+                # Extract order status if present
+                status_match = re.search(r"status[\":\s]+([a-zA-Z_]+)", response)
+                if status_match:
+                    response_data["status"] = status_match.group(1)
+                else:
+                    # Default to NEW status if not found
+                    response_data["status"] = "NEW"
+
+                # Extract trading pair if present
+                symbol_match = re.search(r"symbol[\":\s]+([a-zA-Z0-9]+)", response)
+                if symbol_match:
+                    response_data["symbol"] = symbol_match.group(1)
+
+                # Extract price if present
+                price_match = re.search(r"price[\":\s]+([\d\.]+)", response)
+                if price_match:
+                    response_data["price"] = price_match.group(1)
+
+                # Extract quantity if present
+                qty_match = re.search(r"(quantity|amount|qty)[\":\s]+([\d\.]+)", response)
+                if qty_match:
+                    response_data["quantity"] = qty_match.group(2)
+
+                # Extract executed quantity if present (for filled orders)
+                exec_qty_match = re.search(r"(executed_qty|executedQty|filled)[\":\s]+([\d\.]+)", response)
+                if exec_qty_match:
+                    response_data["executed_qty"] = exec_qty_match.group(2)
+
+                # Extract trade ID if present
+                trade_id_match = re.search(r"(trade_id|tradeId)[\":\s]+([0-9a-zA-Z]+)", response)
+                if trade_id_match:
+                    response_data["trade_id"] = trade_id_match.group(2)
+
+                # Extract fee information if present
+                fee_amount_match = re.search(r"(fee_amount|feeAmount|fee)[\":\s]+([\d\.]+)", response)
+                if fee_amount_match:
+                    response_data["fee_amount"] = fee_amount_match.group(2)
+
+                fee_asset_match = re.search(r"(fee_asset|feeAsset|feeCoin)[\":\s]+([a-zA-Z]+)", response)
+                if fee_asset_match:
+                    response_data["fee_asset"] = fee_asset_match.group(2)
+
+                # Extract timestamp if present - look for updateTime or time
+                time_match = re.search(r"(updateTime|time)[\":\s]+(\d+)", response)
+                if time_match:
+                    # Convert to seconds if in milliseconds
+                    timestamp = int(time_match.group(2))
+                    if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                        timestamp = timestamp / 1000
+                    response_data["transaction_time"] = timestamp
+                else:
+                    # Use current time if not found
+                    response_data["transaction_time"] = time.time()
+
+                return success, response_data
             else:
-                # Default to NEW status if not found
-                response_data["status"] = "NEW"
+                # Order placement failed
+                success = False
+                error_msg = response
 
-            # Extract trading pair if present
-            symbol_match = re.search(r"symbol[\":\s]+([a-zA-Z0-9]+)", response)
-            if symbol_match:
-                response_data["symbol"] = symbol_match.group(1)
+                # Extract error reason if possible
+                error_match = re.search(r"error[\":\s]+(.*)", response)
+                if error_match:
+                    error_msg = error_match.group(1)
 
-            # Extract price if present
-            price_match = re.search(r"price[\":\s]+([\d\.]+)", response)
-            if price_match:
-                response_data["price"] = price_match.group(1)
+                # Extract error code if present
+                error_code_match = re.search(r"code[\":\s]+(-?\d+)", response)
+                if error_code_match:
+                    response_data["error_code"] = int(error_code_match.group(1))
 
-            # Extract quantity if present
-            qty_match = re.search(r"(quantity|amount|qty)[\":\s]+([\d\.]+)", response)
-            if qty_match:
-                response_data["quantity"] = qty_match.group(2)
-
-            # Extract executed quantity if present (for filled orders)
-            exec_qty_match = re.search(r"(executed_qty|executedQty|filled)[\":\s]+([\d\.]+)", response)
-            if exec_qty_match:
-                response_data["executed_qty"] = exec_qty_match.group(2)
-
-            # Extract trade ID if present
-            trade_id_match = re.search(r"(trade_id|tradeId)[\":\s]+([0-9a-zA-Z]+)", response)
-            if trade_id_match:
-                response_data["trade_id"] = trade_id_match.group(2)
-
-            # Extract fee information if present
-            fee_amount_match = re.search(r"(fee_amount|feeAmount|fee)[\":\s]+([\d\.]+)", response)
-            if fee_amount_match:
-                response_data["fee_amount"] = fee_amount_match.group(2)
-
-            fee_asset_match = re.search(r"(fee_asset|feeAsset|feeCoin)[\":\s]+([a-zA-Z]+)", response)
-            if fee_asset_match:
-                response_data["fee_asset"] = fee_asset_match.group(2)
-
-            # Extract timestamp if present
-            time_match = re.search(r"time[\":\s]+(\d+)", response)
-            if time_match:
-                # Convert to seconds if in milliseconds
-                timestamp = int(time_match.group(1))
-                if timestamp > 1000000000000:  # If timestamp is in milliseconds
-                    timestamp = timestamp / 1000
-                response_data["transaction_time"] = timestamp
-            else:
-                # Use current time if not found
-                response_data["transaction_time"] = time.time()
-
-            return success, response_data
-        else:
-            # Order placement failed
-            success = False
-            error_msg = response
-
-            # Extract error reason if possible
-            error_match = re.search(r"error[\":\s]+(.*)", response)
-            if error_match:
-                error_msg = error_match.group(1)
-
-            # Extract error code if present
-            error_code_match = re.search(r"code[\":\s]+(-?\d+)", response)
-            if error_code_match:
-                response_data["error_code"] = int(error_code_match.group(1))
-
-            response_data["error"] = error_msg.strip()
-            return success, response_data
+                response_data["error"] = error_msg.strip()
+                return success, response_data
 
     def _parse_cancel_response(self, response: str, client_order_id: str) -> Tuple[bool, Dict[str, Any]]:
         """
@@ -720,54 +798,110 @@ class QtxPerpetualSharedMemoryManager:
         """
         response_data = {"raw_response": response, "client_order_id": client_order_id}
 
-        # Check for success indicators in the response
-        if "success" in response.lower() or "canceled" in response.lower() or "cancelled" in response.lower():
-            # Extract status if present
-            status_match = re.search(r"status[\":\s]+([a-zA-Z_]+)", response)
-            if status_match:
-                response_data["status"] = status_match.group(1)
-            else:
-                # Default to CANCELED status
-                response_data["status"] = "CANCELED"
-
-            # Extract exchange order ID if present
-            exchange_id_match = re.search(r"order_id[\":\s]+([0-9a-zA-Z]+)", response)
-            if exchange_id_match:
-                response_data["exchange_order_id"] = exchange_id_match.group(1)
-
-            # Extract timestamp if present
-            time_match = re.search(r"time[\":\s]+(\d+)", response)
-            if time_match:
-                # Convert to seconds if in milliseconds
-                timestamp = int(time_match.group(1))
-                if timestamp > 1000000000000:  # If timestamp is in milliseconds
-                    timestamp = timestamp / 1000
-                response_data["transaction_time"] = timestamp
-            else:
-                # Use current time if not found
-                response_data["transaction_time"] = time.time()
-
-            return True, response_data
-        else:
-            # Check for "order does not exist" or similar, which we can also treat as success
-            if "not exist" in response.lower() or "not found" in response.lower():
-                response_data["note"] = "Order already cancelled or does not exist"
-                response_data["status"] = "CANCELED"
-                response_data["transaction_time"] = time.time()
+        # Try to parse the response as JSON first, as the binance-futures response is in JSON format
+        try:
+            import json
+            json_response = json.loads(response)
+            
+            # Check for success (200 status code)
+            if isinstance(json_response, dict) and json_response.get("status") == 200 and "result" in json_response:
+                result = json_response["result"]
+                
+                # Extract status
+                if "status" in result:
+                    response_data["status"] = result["status"]
+                else:
+                    # Default to CANCELED status
+                    response_data["status"] = "CANCELED"
+                
+                # Extract exchange order ID if present
+                if "orderId" in result:
+                    response_data["exchange_order_id"] = str(result["orderId"])
+                
+                # Extract timestamp - look for updateTime or time
+                if "updateTime" in result:
+                    timestamp = result["updateTime"]
+                    if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                        timestamp = timestamp / 1000
+                    response_data["transaction_time"] = timestamp
+                elif "time" in result:
+                    timestamp = result["time"]
+                    if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                        timestamp = timestamp / 1000
+                    response_data["transaction_time"] = timestamp
+                else:
+                    # Use current time if not found
+                    response_data["transaction_time"] = time.time()
+                
                 return True, response_data
+            else:
+                # Check if it's an "order not found" type response, which we can also treat as success
+                error_code = json_response.get("code", 0)
+                error_msg = json_response.get("msg", "")
+                
+                if error_code in [-2013, -2011] or "not exist" in error_msg.lower() or "not found" in error_msg.lower():
+                    response_data["note"] = "Order already cancelled or does not exist"
+                    response_data["status"] = "CANCELED"
+                    response_data["transaction_time"] = time.time()
+                    return True, response_data
+                
+                # JSON parsing worked but response indicates failure
+                response_data["error"] = json_response.get("msg", "Unknown error")
+                if "code" in json_response:
+                    response_data["error_code"] = json_response["code"]
+                
+                return False, response_data
+                
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # If JSON parsing failed, fall back to regex-based parsing
+            # Check for success indicators in the response
+            if "success" in response.lower() or "canceled" in response.lower() or "cancelled" in response.lower():
+                # Extract status if present
+                status_match = re.search(r"status[\":\s]+([a-zA-Z_]+)", response)
+                if status_match:
+                    response_data["status"] = status_match.group(1)
+                else:
+                    # Default to CANCELED status
+                    response_data["status"] = "CANCELED"
 
-            # Cancellation failed
-            error_msg = response
+                # Extract exchange order ID if present - try both formats
+                exchange_id_match = re.search(r"order[iI]d[\":\s]+([0-9a-zA-Z]+)", response)
+                if exchange_id_match:
+                    response_data["exchange_order_id"] = exchange_id_match.group(1)
 
-            # Extract error reason if possible
-            error_match = re.search(r"error[\":\s]+(.*)", response)
-            if error_match:
-                error_msg = error_match.group(1)
+                # Extract timestamp if present - look for updateTime or time
+                time_match = re.search(r"(updateTime|time)[\":\s]+(\d+)", response)
+                if time_match:
+                    # Convert to seconds if in milliseconds
+                    timestamp = int(time_match.group(2))
+                    if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                        timestamp = timestamp / 1000
+                    response_data["transaction_time"] = timestamp
+                else:
+                    # Use current time if not found
+                    response_data["transaction_time"] = time.time()
 
-            # Extract error code if present
-            error_code_match = re.search(r"code[\":\s]+(-?\d+)", response)
-            if error_code_match:
-                response_data["error_code"] = int(error_code_match.group(1))
+                return True, response_data
+            else:
+                # Check for "order does not exist" or similar, which we can also treat as success
+                if "not exist" in response.lower() or "not found" in response.lower():
+                    response_data["note"] = "Order already cancelled or does not exist"
+                    response_data["status"] = "CANCELED"
+                    response_data["transaction_time"] = time.time()
+                    return True, response_data
 
-            response_data["error"] = error_msg.strip()
-            return False, response_data
+                # Cancellation failed
+                error_msg = response
+
+                # Extract error reason if possible
+                error_match = re.search(r"error[\":\s]+(.*)", response)
+                if error_match:
+                    error_msg = error_match.group(1)
+
+                # Extract error code if present
+                error_code_match = re.search(r"code[\":\s]+(-?\d+)", response)
+                if error_code_match:
+                    response_data["error_code"] = int(error_code_match.group(1))
+
+                response_data["error"] = error_msg.strip()
+                return False, response_data
