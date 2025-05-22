@@ -1,81 +1,136 @@
 import asyncio
 import ctypes
 import gc
+import json
 import logging
-import math
 import mmap
 import re
 import time
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
+from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.logger import HummingbotLogger
 
-# Import posix_ipc
 try:
     import posix_ipc
 except ImportError:
     raise ImportError("The 'posix_ipc' module is required. Please install it using 'pip install posix_ipc'.")
 
-# Constants for QTX Shared Memory Order Management
+# Shared memory buffer size constants
 MAX_FLOAT_SIZE = 32
 MAX_KEY_SIZE = 100
 MAX_SYMBOL_SIZE = 100
 MAX_MESSAGE_SIZE = 10000
 MAX_QUEUE_SIZE = 100
 
-# QTX Order Types
-QTX_ORDER_TYPE_IOC = 0
-QTX_ORDER_TYPE_POST_ONLY = 1
-QTX_ORDER_TYPE_GTC = 2
-QTX_ORDER_TYPE_FOK = 3
+# Order type constants
+QTX_ORDER_TYPE_IOC = 0          # Immediate or Cancel
+QTX_ORDER_TYPE_POST_ONLY = 1    # Post Only (maker only)
+QTX_ORDER_TYPE_GTC = 2          # Good Till Cancelled
+QTX_ORDER_TYPE_FOK = 3          # Fill or Kill
 
-# QTX Side Constants
+# Order side constants
 QTX_SIDE_BUY = 1
 QTX_SIDE_SELL = -1
 
-# QTX Position Side Constants
+# Position side constants (ONE-WAY mode - QTX default)
 QTX_POS_SIDE_LONG = 1
-QTX_POS_SIDE_BOTH = 0
+QTX_POS_SIDE_BOTH = 0           # ONE-WAY mode (default for QTX)
 QTX_POS_SIDE_SHORT = -1
 
-# QTX Price Match Constants
-QTX_PRICE_MATCH_NONE = 0
-QTX_PRICE_MATCH_QUEUE = 1
-QTX_PRICE_MATCH_QUEUE_5 = 2
-QTX_PRICE_MATCH_OPPONENT = 3
-QTX_PRICE_MATCH_OPPONENT_5 = 4
+# Price matching strategy constants
+QTX_PRICE_MATCH_NONE = 0        # Use exact price
+QTX_PRICE_MATCH_QUEUE = 1       # Match queue price
+QTX_PRICE_MATCH_QUEUE_5 = 2     # Queue + 5 ticks
+QTX_PRICE_MATCH_OPPONENT = 3    # Match opponent price
+QTX_PRICE_MATCH_OPPONENT_5 = 4  # Opponent + 5 ticks
 
 
-# ctypes structure for Order
+# Hummingbot → QTX Protocol Translation Layer
+# 
+# QTX uses numeric codes for order parameters while Hummingbot uses enums.
+# These functions bridge the semantic gap between the two systems.
+
+def _translate_trade_type_to_side(trade_type: TradeType) -> int:
+    """QTX side encoding: 1=BUY, -1=SELL"""
+    return QTX_SIDE_BUY if trade_type == TradeType.BUY else QTX_SIDE_SELL
+
+
+def _translate_position_side(position_action: PositionAction, trade_type: TradeType) -> int:
+    """
+    Maps position intent to QTX's ONE-WAY mode position side encoding.
+    
+    Critical: In ONE-WAY mode, pos_side indicates *which position you're affecting*,
+    not the direction you're trading. This is counterintuitive but correct:
+    
+    Opening positions: pos_side = direction of new position
+    Closing positions: pos_side = direction of existing position being closed
+    """
+    if position_action == PositionAction.OPEN:
+        return QTX_POS_SIDE_LONG if trade_type == TradeType.BUY else QTX_POS_SIDE_SHORT
+    elif position_action == PositionAction.CLOSE:
+        # When closing, specify the position you're closing (opposite of trade direction)
+        return QTX_POS_SIDE_SHORT if trade_type == TradeType.BUY else QTX_POS_SIDE_LONG
+    else:
+        # NIL defaults to OPEN behavior (fallback for smart position detection)
+        return QTX_POS_SIDE_LONG if trade_type == TradeType.BUY else QTX_POS_SIDE_SHORT
+
+
+def _translate_order_type(order_type: OrderType) -> int:
+    """
+    Maps Hummingbot order types to QTX execution policies.
+    
+    Note: MARKET orders are architectural violations here - they should be 
+    converted to aggressive LIMIT orders by the derivative connector.
+    """
+    order_type_map = {
+        OrderType.LIMIT: QTX_ORDER_TYPE_GTC,
+        OrderType.LIMIT_MAKER: QTX_ORDER_TYPE_POST_ONLY,
+        OrderType.MARKET: QTX_ORDER_TYPE_GTC,  # Fallback - should not happen
+    }
+    return order_type_map.get(order_type, QTX_ORDER_TYPE_GTC)
+
+
 class Order(ctypes.Structure):
+    """
+    Binary-compatible order structure for QTX shared memory protocol.
+    
+    WARNING: Field order and types must match QTX's C++ structure exactly.
+    Any changes here require coordination with QTX system implementation.
+    """
     _fields_ = [
-        ("mode", ctypes.c_longlong),  # 0: init key, 1: place order, -1: cancel order
-        ("side", ctypes.c_longlong),  # 1: BUY, -1: SELL
-        ("pos_side", ctypes.c_longlong),  # 1: LONG, 0: BOTH, -1: SHORT
-        ("client_order_id", ctypes.c_ulonglong),  # Client-defined order ID
-        ("order_type", ctypes.c_ulong),  # 0: IOC, 1: POST_ONLY, 2: GTC, 3: FOK
-        ("price_match", ctypes.c_ulong),  # 0: NONE, 1: QUEUE, 2: QUEUE_5, 3: OPPONENT, 4: OPPONENT_5
-        ("place_ts_ns", ctypes.c_ulong),  # Timestamp of order placement (set by client or manager)
-        ("res_ts_ns", ctypes.c_ulong),  # Timestamp of response (set by manager)
-        ("size", ctypes.c_char * MAX_FLOAT_SIZE),
-        ("price", ctypes.c_char * MAX_FLOAT_SIZE),
-        ("api_key", ctypes.c_char * MAX_KEY_SIZE),
-        ("api_secret", ctypes.c_char * MAX_KEY_SIZE),
-        ("symbol", ctypes.c_char * MAX_SYMBOL_SIZE),
-        ("res_msg", ctypes.c_char * MAX_MESSAGE_SIZE),
+        ("mode", ctypes.c_longlong),                    # 0: init key, 1: place order, -1: cancel order
+        ("side", ctypes.c_longlong),                    # 1: BUY, -1: SELL
+        ("pos_side", ctypes.c_longlong),                # 1: LONG, 0: BOTH, -1: SHORT
+        ("client_order_id", ctypes.c_ulonglong),        # Client-defined order ID (numeric)
+        ("order_type", ctypes.c_ulong),                 # Order type (IOC, POST_ONLY, GTC, FOK)
+        ("price_match", ctypes.c_ulong),                # Price matching strategy
+        ("place_ts_ns", ctypes.c_ulong),                # Order placement timestamp (nanoseconds)
+        ("res_ts_ns", ctypes.c_ulong),                  # Response timestamp (set by manager)
+        ("size", ctypes.c_char * MAX_FLOAT_SIZE),       # Order size as string
+        ("price", ctypes.c_char * MAX_FLOAT_SIZE),      # Order price as string
+        ("api_key", ctypes.c_char * MAX_KEY_SIZE),      # Exchange API key
+        ("api_secret", ctypes.c_char * MAX_KEY_SIZE),   # Exchange API secret  
+        ("symbol", ctypes.c_char * MAX_SYMBOL_SIZE),    # Trading pair symbol
+        ("res_msg", ctypes.c_char * MAX_MESSAGE_SIZE),  # Response message from exchange
     ]
 
 
 ORDER_SIZE = ctypes.sizeof(Order)
 
 
-# ctypes structure for Queue
 class Queue(ctypes.Structure):
+    """
+    Lock-free circular buffer for high-frequency order communication.
+    
+    Producer (Hummingbot) writes at to_idx, Consumer (QTX) reads from from_idx.
+    Synchronization relies on atomic index updates and response timestamps.
+    """
     _fields_ = [
-        ("from_idx", ctypes.c_longlong),
-        ("to_idx", ctypes.c_longlong),
-        ("orders", Order * MAX_QUEUE_SIZE),
+        ("from_idx", ctypes.c_longlong),    # Consumer index (read by manager)
+        ("to_idx", ctypes.c_longlong),      # Producer index (written by client)
+        ("orders", Order * MAX_QUEUE_SIZE), # Circular buffer of orders
     ]
 
 
@@ -84,24 +139,18 @@ SHM_SIZE = ctypes.sizeof(Queue)
 
 class QtxPerpetualSharedMemoryManager:
     """
-    Manager for QTX Perpetual shared memory operations.
-
-    This class handles:
-    - Shared memory initialization and cleanup
-    - API key initialization
-    - Order placement and cancellation
-    - Response tracking
+    High-performance IPC bridge to QTX order execution system.
+    
+    Responsibilities:
+    - Translate Hummingbot semantics to QTX protocol
+    - Manage shared memory lifecycle and error recovery
+    - Provide synchronous API over asynchronous IPC
+    
+    Architecture: This is a pure translation layer. Business logic like
+    market order conversion belongs in the derivative connector.
     """
 
-    _instance = None
     _logger: Optional[HummingbotLogger] = None
-
-    @classmethod
-    def get_instance(cls, *args, **kwargs):
-        """Singleton pattern implementation"""
-        if cls._instance is None:
-            cls._instance = cls(*args, **kwargs)
-        return cls._instance
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -118,52 +167,55 @@ class QtxPerpetualSharedMemoryManager:
         self, api_key: str = None, api_secret: str = None, shm_name: str = None, exchange_name_on_qtx: str = None
     ):
         """
-        Initialize the shared memory manager
-
-        :param api_key: API key for authentication
-        :param api_secret: API secret for authentication
-        :param shm_name: Name of the shared memory segment (required, e.g., "/place_order_kevinlee")
-        :param exchange_name_on_qtx: Exchange name to use for QTX (REQUIRED, no default)
-        :raises: ValueError if shm_name is not provided
+        Initialize shared memory manager with required credentials and settings.
+        
+        Args:
+            api_key: Exchange API key for authentication
+            api_secret: Exchange API secret for authentication  
+            shm_name: Shared memory segment name (e.g., "/place_order_kevinlee")
+            exchange_name_on_qtx: Exchange identifier for QTX system
+        
+        Raises:
+            ValueError: If any required parameter is missing or empty
         """
         if not shm_name:
-            raise ValueError("Shared memory name (shm_name) must be provided")
-
-        if not api_key or not api_secret:
-            self.logger().warning("API key or secret is missing. Order placement will fail without valid credentials.")
+            raise ValueError("Shared memory name (shm_name) must be provided and cannot be empty")
+        
+        if not api_key:
+            raise ValueError("API key must be provided and cannot be empty")
+            
+        if not api_secret:
+            raise ValueError("API secret must be provided and cannot be empty")
+            
+        if not exchange_name_on_qtx:
+            raise ValueError("Exchange name on QTX (exchange_name_on_qtx) must be provided and cannot be empty")
 
         self._api_key = api_key
         self._api_secret = api_secret
         self._shm_name = shm_name
 
-        if exchange_name_on_qtx is None:
-            self.logger().warning(
-                "No exchange_name_on_qtx provided to SHM manager! QTX trading pair conversion may fail."
-            )
         self._exchange_name_on_qtx = exchange_name_on_qtx
 
-        # Shared memory objects
         self._shm = None
         self._memory_map = None
         self._queue_ptr = None
-
-        # State tracking
         self._is_connected = False
         self._api_key_initialized = False
-        self._pending_orders = {}  # client_order_id -> order reference
-
-        # Connection tracking
+        self._pending_orders = {}
         self._last_connection_error = None
         self._connection_attempts = 0
 
-    # --- Connection Management ---
+    # Connection Management
 
     async def connect(self) -> bool:
         """
-        Establish a connection to the shared memory segment
-
-        :return: True when connection is successful
-        :raises: ConnectionError if connection fails
+        Connect to the shared memory segment and initialize the queue.
+        
+        Returns:
+            bool: True if connection successful
+            
+        Raises:
+            ConnectionError: If shared memory segment doesn't exist or connection fails
         """
         # Check if we're already connected
         if self._is_connected and self._memory_map is not None:
@@ -213,7 +265,6 @@ class QtxPerpetualSharedMemoryManager:
 
     def _cleanup_resources(self):
         """Clean up shared memory resources"""
-        # Clean up shared memory resources
 
         # Delete references to the buffer in reverse order
         if hasattr(self, "_queue_ptr") and self._queue_ptr is not None:
@@ -341,33 +392,29 @@ class QtxPerpetualSharedMemoryManager:
         self,
         client_order_id: str,
         symbol: str,
-        side: int,  # 1 for BUY, -1 for SELL
-        position_side: int,  # 1 for LONG, 0 for BOTH, -1 for SHORT
-        order_type: int,  # 0: IOC, 1: POST_ONLY, 2: GTC, 3: FOK
+        trade_type: TradeType,
+        position_action: PositionAction,
+        order_type: OrderType,
         price: Decimal,
         size: Decimal,
-        price_match: int = 0,  # 0: NONE, 1: QUEUE, 2: QUEUE_5, 3: OPPONENT, 4: OPPONENT_5
+        price_match: int = 0,
     ) -> Tuple[bool, Dict[str, Any]]:
         """
-        Place an order using shared memory
-
-        :param client_order_id: Unique client order ID
-        :param symbol: Trading pair symbol in exchange format (e.g., BTCUSDT)
-        :param side: Order side (1 for BUY, -1 for SELL)
-        :param position_side: Position side (1 for LONG, 0 for BOTH, -1 for SHORT)
-        :param order_type: Order type (0: IOC, 1: POST_ONLY, 2: GTC, 3: FOK)
-        :param price: Order price
-        :param size: Order size
-        :param price_match: Price matching strategy (0: exact price)
-        :return: Tuple of (success, response_data)
+        Submit order to QTX via shared memory IPC.
+        
+        Contract: Expects pre-processed parameters (no MARKET orders, valid prices).
+        Returns: (success: bool, response_data: dict) where response_data contains
+        either order details (success) or error information (failure).
         """
+        # Translate parameters to QTX format
+        side = _translate_trade_type_to_side(trade_type)
+        position_side = _translate_position_side(position_action, trade_type)
+        order_type_int = _translate_order_type(order_type)
+        
         # Parameter validation
         if not symbol or not symbol.strip():
             self.logger().error("Cannot place order: Empty trading pair symbol provided")
             return False, {"error": "Empty trading pair symbol provided"}
-
-        # No validation for size or price - passing through directly to shared memory
-        # Strategy code is responsible for parameter validation
 
         # Check API key availability
         if not self._api_key or not self._api_secret:
@@ -395,79 +442,53 @@ class QtxPerpetualSharedMemoryManager:
                 return False, {"error": f"API key initialization error: {str(e)}"}
 
         try:
-            # Convert client_order_id string to integer
+            # Convert client_order_id to integer
             try:
                 client_order_id_int = int(client_order_id)
             except ValueError:
-                # If not a pure integer, hash it to get a numeric value
                 client_order_id_int = abs(hash(client_order_id)) % (2**64 - 1)
 
-            # Get a new index for the order placement
+            # Get order slot and initialize
             place_idx = self._queue_ptr.to_idx
             place_order_ref = self._queue_ptr.orders[place_idx]
-
-            # Zero out the memory for this order
             ctypes.memset(ctypes.addressof(place_order_ref), 0, ORDER_SIZE)
 
-            # Set the order parameters
-            place_order_ref.mode = 1  # place order mode
+            # Set order parameters
+            place_order_ref.mode = 1
             place_order_ref.side = side
             place_order_ref.pos_side = position_side
             place_order_ref.client_order_id = client_order_id_int
-            place_order_ref.order_type = order_type
+            place_order_ref.order_type = order_type_int
             place_order_ref.price_match = price_match
             place_order_ref.size = str(size).encode("utf-8")
+            
+            # Set placement timestamp in nanoseconds
+            place_order_ref.place_ts_ns = int(time.time() * 1_000_000_000)
 
-            # Handle NaN or None price for market orders
-            # For IOC market orders (order_type == 0) or any order with NaN/None price
-            is_nan_price = False
-
-            # Check for NaN in multiple ways to catch all edge cases
-            if price is None:
-                is_nan_price = True
-            elif isinstance(price, float) and math.isnan(price):
-                is_nan_price = True
-            elif price != price:  # NaN comparison
-                is_nan_price = True
-            elif hasattr(price, "is_nan") and price.is_nan():
-                is_nan_price = True
-
-            # If it's a market order (IOC) with no price, or price is NaN, use a fixed non-zero price
-            # Binance requires prices above minimum thresholds even for market orders
-            if order_type == QTX_ORDER_TYPE_IOC or is_nan_price:
-                place_order_ref.price = "100.0".encode(
-                    "utf-8"
-                )  # Use 100.0 to circumvent Binance's minimum price threshold
-                self.logger().info(f"Setting market order price to 100.0 for order {client_order_id}")
-            else:
-                place_order_ref.price = str(price).encode("utf-8")
-
+            # Use the provided price (derivative connector handles market order pricing)
+            place_order_ref.price = str(price).encode("utf-8")
             place_order_ref.symbol = symbol.encode("utf-8")
 
-            # Store reference to the order for tracking, if needed
+            # Track pending order
             self._pending_orders[client_order_id] = place_order_ref
 
-            self.logger().debug(f"Placing order: {symbol}, size={size}, client_order_id={client_order_id}")
+            self.logger().debug(f"Placing order: {symbol}, size={size}, price={price}, client_order_id={client_order_id}")
 
-            # Notify the order manager by incrementing the queue's to_idx
+            # Submit order to queue
             self._queue_ptr.to_idx = (self._queue_ptr.to_idx + 1) % MAX_QUEUE_SIZE
 
-            # Wait for response using polling approach (same as reference client)
+            # Wait for response
             self.logger().debug(f"Waiting for order placement response for {client_order_id}...")
             timeout_seconds = 10.0
             start_time = time.time()
 
             try:
-                # Poll for response by checking res_ts_ns
                 while place_order_ref.res_ts_ns == 0:
-                    # Check for timeout
                     if time.time() - start_time > timeout_seconds:
                         raise asyncio.TimeoutError("Order placement timed out")
+                    await asyncio.sleep(0.01)
 
-                    # Sleep briefly to avoid CPU spinning
-                    await asyncio.sleep(0.01)  # 10ms sleep
-
-                # Get response data once received
+                # Process response
                 response = place_order_ref.res_msg.decode(errors="ignore")
                 self.logger().debug(f"Order placement response received for {client_order_id}: {response}")
 
@@ -489,18 +510,12 @@ class QtxPerpetualSharedMemoryManager:
             self.logger().error(f"Error placing order: {e}", exc_info=True)
             return False, {"error": f"Error placing order: {str(e)}"}
         finally:
-            # Clean up tracking references if needed
+            # Clean up tracking
             if client_order_id in self._pending_orders:
                 del self._pending_orders[client_order_id]
 
     async def cancel_order(self, client_order_id: str, symbol: str) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Cancel an order using shared memory
-
-        :param client_order_id: Client order ID to cancel
-        :param symbol: Trading pair symbol in exchange format
-        :return: Tuple of (success, response_data)
-        """
+        """Cancel an order using shared memory communication with QTX order manager."""
         # Parameter validation
         if not symbol or not symbol.strip():
             self.logger().error("Cannot cancel order: Empty trading pair symbol provided")
@@ -510,7 +525,7 @@ class QtxPerpetualSharedMemoryManager:
             self.logger().error("Cannot cancel order: Empty client order ID provided")
             return False, {"error": "Empty client order ID provided"}
 
-        # Check API key availability (cancellation also requires API key)
+        # Check API key availability
         if not self._api_key or not self._api_secret:
             self.logger().error("Cannot cancel order: API key or secret is missing")
             return False, {"error": "API key or secret is missing"}
@@ -551,35 +566,31 @@ class QtxPerpetualSharedMemoryManager:
             # Zero out the memory for this order
             ctypes.memset(ctypes.addressof(cancel_order_ref), 0, ORDER_SIZE)
 
-            # Set the cancellation parameters
-            cancel_order_ref.mode = -1  # cancel order mode
+            # Set cancellation parameters
+            cancel_order_ref.mode = -1
             cancel_order_ref.client_order_id = client_order_id_int
             cancel_order_ref.symbol = symbol.encode("utf-8")
 
-            # Store reference to the cancel request for tracking, if needed
+            # Track cancel request
             self._pending_orders[cancel_track_id] = cancel_order_ref
 
             self.logger().debug(f"Canceling order with client ID: {client_order_id} for symbol: {symbol}")
 
-            # Notify the order manager by incrementing the queue's to_idx
+            # Submit cancellation to queue
             self._queue_ptr.to_idx = (self._queue_ptr.to_idx + 1) % MAX_QUEUE_SIZE
 
-            # Wait for response using polling approach (same as reference client)
+            # Wait for response
             self.logger().debug(f"Waiting for order cancellation response for {client_order_id}...")
             timeout_seconds = 10.0
             start_time = time.time()
 
             try:
-                # Poll for response by checking res_ts_ns
                 while cancel_order_ref.res_ts_ns == 0:
-                    # Check for timeout
                     if time.time() - start_time > timeout_seconds:
                         raise asyncio.TimeoutError("Order cancellation timed out")
+                    await asyncio.sleep(0.01)
 
-                    # Sleep briefly to avoid CPU spinning
-                    await asyncio.sleep(0.01)  # 10ms sleep
-
-                # Get response data once received
+                # Process response
                 response = cancel_order_ref.res_msg.decode(errors="ignore")
                 self.logger().debug(f"Order cancellation response received for {client_order_id}: {response}")
 
@@ -607,24 +618,89 @@ class QtxPerpetualSharedMemoryManager:
 
     # --- Response Parsing Methods ---
 
-    def _parse_order_response(self, response: str, client_order_id: str) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Parse order placement response
+    def _is_order_not_found_error(self, error_msg: str, error_code: Optional[int] = None) -> bool:
+        """Check if error indicates order not found using universal patterns."""
+        if not error_msg:
+            return False
 
-        :param response: Response message from QTX
-        :param client_order_id: Client order ID
-        :return: Tuple of (success, response_data)
+        error_msg_lower = error_msg.lower()
+
+        # Common order not found patterns
+        not_found_patterns = [
+            "not exist",
+            "not found",
+            "does not exist",
+            "order not found",
+            "invalid order",
+            "unknown order",
+            "order does not exist",
+            "no such order",
+            "order id not found",
+            "order already filled",
+            "order already cancelled",
+            "order already canceled",  # US spelling
+            "order expired",
+            "order rejected",
+        ]
+
+        return any(pattern in error_msg_lower for pattern in not_found_patterns)
+
+    def _is_successful_json_response(self, json_response: dict) -> bool:
+        """Check if JSON response indicates success."""
+        return (isinstance(json_response, dict) 
+                and json_response.get("status") == 200 
+                and "result" in json_response)
+
+    def _is_successful_text_response(self, response: str) -> bool:
+        """Check if text response indicates success using pattern matching."""
+        if not response:
+            return False
+            
+        response_lower = response.lower()
+        success_patterns = ["success", "executed"]
+        return any(pattern in response_lower for pattern in success_patterns)
+
+    def _is_successful_cancel_response(self, response: str) -> bool:
+        """Check if text response indicates successful cancellation."""
+        if not response:
+            return False
+            
+        response_lower = response.lower()
+        cancel_success_patterns = ["success", "canceled", "cancelled"]
+        return any(pattern in response_lower for pattern in cancel_success_patterns)
+
+    def _extract_timestamp_from_response(self, response_data: dict) -> float:
         """
+        Extracts timestamp from response data with proper conversion.
+        Handles both updateTime and time fields, converting milliseconds to seconds.
+        
+        :param response_data: Dictionary containing response data
+        :return: Timestamp in seconds (float)
+        """
+        # Try updateTime first, then time
+        timestamp_fields = ["updateTime", "time"]
+        
+        for field in timestamp_fields:
+            if field in response_data:
+                timestamp = response_data[field]
+                # Convert from milliseconds to seconds if needed
+                if timestamp > 1000000000000:  # If timestamp is in milliseconds
+                    timestamp = timestamp / 1000
+                return timestamp
+        
+        # Use current time if not found
+        return time.time()
+
+    def _parse_order_response(self, response: str, client_order_id: str) -> Tuple[bool, Dict[str, Any]]:
+        """Parse order placement response."""
         response_data = {"raw_response": response, "client_order_id": client_order_id}
         success: bool
 
         # Try to parse the response as JSON first, as the binance-futures response is in JSON format
         try:
-            import json
-
             json_response = json.loads(response)
-            # Check for success (200 status code)
-            if isinstance(json_response, dict) and json_response.get("status") == 200 and "result" in json_response:
+            # Check for success using extracted method
+            if self._is_successful_json_response(json_response):
                 success = True
                 result = json_response["result"]
 
@@ -697,8 +773,8 @@ class QtxPerpetualSharedMemoryManager:
             # If JSON parsing failed, fall back to regex-based parsing
             # This is the original behavior for non-JSON responses
 
-            # Check for success indicators in the response
-            if "success" in response.lower() or "executed" in response.lower():
+            # Check for success indicators using extracted method
+            if self._is_successful_text_response(response):
                 success = True
 
                 # Extract exchange order ID if present
@@ -789,35 +865,28 @@ class QtxPerpetualSharedMemoryManager:
                 return success, response_data
 
     def _parse_cancel_response(self, response: str, client_order_id: str) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Parse order cancellation response
-
-        :param response: Response message from QTX
-        :param client_order_id: Client order ID
-        :return: Tuple of (success, response_data)
-        """
+        """Parse order cancellation response."""
         response_data = {"raw_response": response, "client_order_id": client_order_id}
 
         # Try to parse the response as JSON first, as the binance-futures response is in JSON format
         try:
-            import json
             json_response = json.loads(response)
-            
-            # Check for success (200 status code)
-            if isinstance(json_response, dict) and json_response.get("status") == 200 and "result" in json_response:
+
+            # Check for success using extracted method
+            if self._is_successful_json_response(json_response):
                 result = json_response["result"]
-                
+
                 # Extract status
                 if "status" in result:
                     response_data["status"] = result["status"]
                 else:
                     # Default to CANCELED status
                     response_data["status"] = "CANCELED"
-                
+
                 # Extract exchange order ID if present
                 if "orderId" in result:
                     response_data["exchange_order_id"] = str(result["orderId"])
-                
+
                 # Extract timestamp - look for updateTime or time
                 if "updateTime" in result:
                     timestamp = result["updateTime"]
@@ -832,30 +901,33 @@ class QtxPerpetualSharedMemoryManager:
                 else:
                     # Use current time if not found
                     response_data["transaction_time"] = time.time()
-                
+
                 return True, response_data
             else:
                 # Check if it's an "order not found" type response, which we can also treat as success
                 error_code = json_response.get("code", 0)
                 error_msg = json_response.get("msg", "")
-                
-                if error_code in [-2013, -2011] or "not exist" in error_msg.lower() or "not found" in error_msg.lower():
+
+                if self._is_order_not_found_error(error_msg, error_code):
+                    self.logger().debug(
+                        f"Order {client_order_id} not found (error_code: {error_code}, msg: '{error_msg}'). Treating as already cancelled."
+                    )
                     response_data["note"] = "Order already cancelled or does not exist"
                     response_data["status"] = "CANCELED"
                     response_data["transaction_time"] = time.time()
                     return True, response_data
-                
+
                 # JSON parsing worked but response indicates failure
                 response_data["error"] = json_response.get("msg", "Unknown error")
                 if "code" in json_response:
                     response_data["error_code"] = json_response["code"]
-                
+
                 return False, response_data
-                
+
         except (json.JSONDecodeError, ValueError, TypeError):
             # If JSON parsing failed, fall back to regex-based parsing
-            # Check for success indicators in the response
-            if "success" in response.lower() or "canceled" in response.lower() or "cancelled" in response.lower():
+            # Check for success indicators using extracted method
+            if self._is_successful_cancel_response(response):
                 # Extract status if present
                 status_match = re.search(r"status[\":\s]+([a-zA-Z_]+)", response)
                 if status_match:
@@ -884,7 +956,10 @@ class QtxPerpetualSharedMemoryManager:
                 return True, response_data
             else:
                 # Check for "order does not exist" or similar, which we can also treat as success
-                if "not exist" in response.lower() or "not found" in response.lower():
+                if self._is_order_not_found_error(response):
+                    self.logger().debug(
+                        f"Order {client_order_id} not found in response: '{response}'. Treating as already cancelled."
+                    )
                     response_data["note"] = "Order already cancelled or does not exist"
                     response_data["status"] = "CANCELED"
                     response_data["transaction_time"] = time.time()

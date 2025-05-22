@@ -1,7 +1,12 @@
-#!/usr/bin/env python
 """
-QTX Perpetual Derivative Connector with dynamic exchange backend
-Integrates QTX market data via UDP with parent exchange trading capabilities
+QTX Perpetual Connector: Dynamic Runtime Inheritance Architecture
+
+Combines QTX's market data feed with any supported exchange's trading API.
+Uses runtime class generation to inherit from user-specified parent exchange
+while overriding specific methods for QTX integration.
+
+Key Innovation: Market orders are automatically converted to aggressive LIMIT
+orders using real-time pricing, with intelligent position action detection.
 """
 import asyncio
 import importlib
@@ -41,7 +46,12 @@ EXCHANGE_CONNECTOR_CLASSES = {
 
 
 class QtxPerpetualDerivative(PerpetualDerivativePyBase):
-    """Dynamic connector that creates runtime subclass of specified exchange backend"""
+    """
+    Factory class for dynamic exchange inheritance.
+    
+    __new__ returns a runtime-generated class that inherits from the specified
+    parent exchange, enabling QTX market data with any exchange's trading logic.
+    """
 
     def __new__(
         cls,
@@ -76,9 +86,16 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         module = importlib.import_module(exchange_info["module"])
         base_exchange_class = getattr(module, exchange_info["class"])
 
-        # Create a dynamic class that inherits from the selected exchange
+        # Runtime class generation: Inherit from selected exchange + QTX overrides
         class QtxDynamicConnector(base_exchange_class):
-            """QTX market data with parent exchange trading capabilities"""
+            """
+            Hybrid connector: Parent exchange API + QTX market data + Smart features.
+            
+            Architecture: Inherits everything from parent exchange except:
+            - Market data (overridden for QTX UDP feed)
+            - Order placement (overridden for market order conversion + SHM)
+            - Position detection (overridden for intelligent action detection)
+            """
 
             def __init__(self, *args, **kwargs):
                 # Extract QTX-specific parameters
@@ -138,7 +155,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             f"Please add an 'exchange_name_on_qtx' entry in EXCHANGE_CONNECTOR_CLASSES for this exchange."
                         )
                         raise ValueError(f"Missing exchange_name_on_qtx configuration for {self._exchange_backend}")
-                    self._shm_manager = QtxPerpetualSharedMemoryManager.get_instance(
+                    self._shm_manager = QtxPerpetualSharedMemoryManager(
                         api_key=self._exchange_api_key,
                         api_secret=self._exchange_api_secret,
                         shm_name=self._qtx_shared_memory_name,
@@ -198,7 +215,14 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 position_action: PositionAction = PositionAction.NIL,
                 **kwargs,
             ) -> Tuple[str, float]:
-                """Places order using QTX shared memory"""
+                """
+                Intelligent order placement with market order conversion and position detection.
+                
+                Features:
+                1. Auto-converts MARKET orders to aggressive LIMIT orders (±10% pricing)
+                2. Auto-detects position actions when not explicitly provided
+                3. Routes through QTX shared memory for high-performance execution
+                """
                 if self.shm_manager is not None:
                     # Use QTX shared memory for order placement
                     try:
@@ -216,45 +240,62 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             f"Order placement: Converting {trading_pair} to exchange format: {exchange_pair}"
                         )
                         
-                        # Convert parameters to expected types for shared memory
-                        side_int = 1 if trade_type == TradeType.BUY else -1
+                        # Smart position action detection for ONE-WAY mode
+                        # If position_action is not explicitly provided, determine it intelligently
+                        final_position_action = self._determine_smart_position_action(
+                            trading_pair, trade_type, position_action
+                        )
                         
-                        # Determine position side based on position action and trade type
-                        # For HEDGE mode: LONG positions use BUY orders, SHORT positions use SELL orders
-                        if position_action == PositionAction.OPEN:
-                            if trade_type == TradeType.BUY:
-                                position_side_int = 1  # LONG
-                            else:
-                                position_side_int = 2  # SHORT
-                        elif position_action == PositionAction.CLOSE:
-                            # Closing positions - opposite side
-                            if trade_type == TradeType.BUY:
-                                position_side_int = 2  # Closing SHORT
-                            else:
-                                position_side_int = 1  # Closing LONG
-                        else:
-                            # When position_action is NIL, default to OPEN behavior in HEDGE mode
-                            if trade_type == TradeType.BUY:
-                                position_side_int = 1  # LONG
-                            else:
-                                position_side_int = 2  # SHORT
+                        self.logger().debug(
+                            f"Position action: {position_action.name} → {final_position_action.name} "
+                            f"(auto-detected for ONE-WAY mode)"
+                        )
+                        
+                        # Handle market order pricing - QTX doesn't support market orders
+                        final_price = price
+                        final_order_type = order_type
+                        
+                        if order_type == OrderType.MARKET:
+                            # Convert MARKET order to aggressive LIMIT order
+                            try:
+                                # Get current market price from order book
+                                current_price = await self._get_current_market_price(trading_pair, trade_type)
+                                if current_price is None:
+                                    raise Exception(f"Unable to get current market price for {trading_pair}")
                                 
-                        # Map order types to shared memory format
-                        order_type_map = {
-                            OrderType.LIMIT: 2,  # GTC
-                            OrderType.LIMIT_MAKER: 1,  # POST_ONLY
-                            OrderType.MARKET: 0,  # IOC
-                        }
-                        order_type_int = order_type_map.get(order_type, 2)  # Default to GTC
-
-                        # Place the order using shared memory
+                                # Calculate aggressive price (±3% from current market price)
+                                price_adjustment = Decimal("0.03")  # 3%
+                                if trade_type == TradeType.BUY:
+                                    # BUY: Use higher price to ensure execution at best ask
+                                    aggressive_price = current_price * (Decimal("1") + price_adjustment)
+                                else:
+                                    # SELL: Use lower price to ensure execution at best bid  
+                                    aggressive_price = current_price * (Decimal("1") - price_adjustment)
+                                
+                                # CRITICAL: Quantize price to match exchange precision rules
+                                final_price = self.quantize_order_price(trading_pair, aggressive_price)
+                                
+                                # Convert to GTC LIMIT order
+                                final_order_type = OrderType.LIMIT
+                                
+                                self.logger().info(
+                                    f"Converting MARKET {trade_type.name} order to LIMIT: "
+                                    f"current_price={current_price}, aggressive_price={aggressive_price} → "
+                                    f"quantized_price={final_price} (±{price_adjustment*100}%) for {trading_pair}"
+                                )
+                                
+                            except Exception as e:
+                                self.logger().error(f"Error calculating market order price for {trading_pair}: {e}")
+                                raise Exception(f"Failed to convert MARKET order to LIMIT: {e}")
+                        
+                        # Place the order using shared memory - SHM manager handles parameter translation
                         success, result = await self.shm_manager.place_order(
                             client_order_id=order_id,
                             symbol=exchange_pair,
-                            side=side_int,
-                            position_side=position_side_int,
-                            order_type=order_type_int,
-                            price=price,
+                            trade_type=trade_type,
+                            position_action=final_position_action,  # Use smart-detected position action
+                            order_type=final_order_type,
+                            price=final_price,
                             size=amount,
                             price_match=0,  # NONE for now
                         )
@@ -279,6 +320,117 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 else:
                     raise Exception("QTX shared memory manager is not initialized. Order placement failed.")
 
+            async def _get_current_market_price(self, trading_pair: str, trade_type: TradeType) -> Optional[Decimal]:
+                """
+                Get current market price from order book for market order conversion.
+                
+                :param trading_pair: The trading pair in Hummingbot format
+                :param trade_type: BUY or SELL to determine bid vs ask price
+                :return: Current market price or None if not available
+                """
+                try:
+                    # Use the parent exchange's get_price method
+                    # For BUY orders, we want the ask price (is_buy=True)
+                    # For SELL orders, we want the bid price (is_buy=False)
+                    is_buy = trade_type == TradeType.BUY
+                    current_price = self.get_price(trading_pair, is_buy)
+                    
+                    if current_price is None or current_price.is_nan():
+                        self.logger().warning(f"Unable to get current market price for {trading_pair}")
+                        return None
+                    
+                    self.logger().debug(
+                        f"Retrieved current market price for {trading_pair}: {current_price} "
+                        f"({'ask' if is_buy else 'bid'} price for {trade_type.name} order)"
+                    )
+                    return current_price
+                    
+                except Exception as e:
+                    self.logger().error(f"Error getting current market price for {trading_pair}: {e}")
+                    return None
+
+            def _determine_smart_position_action(
+                self, trading_pair: str, trade_type: TradeType, provided_action: PositionAction
+            ) -> PositionAction:
+                """
+                Smart position action detection for user-friendly trading.
+                
+                Problem: Most users don't specify position_action, but ONE-WAY mode
+                requires knowing whether to OPEN new positions or CLOSE existing ones.
+                
+                Solution: Inspect current positions and auto-detect user intent:
+                - Explicit action provided → Respect user intent
+                - Opposing direction to existing position → Auto-detect CLOSE
+                - Same direction or no position → Auto-detect OPEN
+                """
+                # If user explicitly provided a non-NIL action, respect their intent
+                if provided_action != PositionAction.NIL:
+                    self.logger().debug(
+                        f"Using user-provided position action: {provided_action.name} for {trade_type.name}"
+                    )
+                    return provided_action
+                
+                try:
+                    # Get current positions for this trading pair
+                    current_positions = self.account_positions
+                    position_key = trading_pair  # Position key might vary by exchange
+                    
+                    self.logger().debug(f"Checking current positions for {trading_pair}: {len(current_positions)} total positions")
+                    
+                    # Look for existing position for this trading pair
+                    existing_position = None
+                    for key, position in current_positions.items():
+                        if position.trading_pair == trading_pair:
+                            existing_position = position
+                            self.logger().debug(
+                                f"Found existing position: {position.trading_pair}, "
+                                f"amount={position.amount}, side={position.position_side.name if hasattr(position, 'position_side') else 'unknown'}"
+                            )
+                            break
+                    
+                    if existing_position is None or existing_position.amount == 0:
+                        # No existing position - use OPEN for any new order
+                        self.logger().debug(f"No existing position found for {trading_pair} → Using OPEN for {trade_type.name}")
+                        return PositionAction.OPEN
+                    
+                    # Existing position logic for ONE-WAY mode
+                    if existing_position.amount > 0:
+                        # Current LONG position
+                        if trade_type == TradeType.SELL:
+                            # SELL order with LONG position → CLOSE the long
+                            self.logger().info(
+                                f"Auto-detected: LONG position exists, SELL order → Converting to CLOSE "
+                                f"(closing {existing_position.amount} LONG position)"
+                            )
+                            return PositionAction.CLOSE
+                        else:
+                            # BUY order with LONG position → Add to position (OPEN)
+                            self.logger().debug(f"LONG position exists, BUY order → Using OPEN (add to position)")
+                            return PositionAction.OPEN
+                    
+                    elif existing_position.amount < 0:
+                        # Current SHORT position  
+                        if trade_type == TradeType.BUY:
+                            # BUY order with SHORT position → CLOSE the short
+                            self.logger().info(
+                                f"Auto-detected: SHORT position exists, BUY order → Converting to CLOSE "
+                                f"(closing {abs(existing_position.amount)} SHORT position)"
+                            )
+                            return PositionAction.CLOSE
+                        else:
+                            # SELL order with SHORT position → Add to position (OPEN)
+                            self.logger().debug(f"SHORT position exists, SELL order → Using OPEN (add to position)")
+                            return PositionAction.OPEN
+                    
+                    # Fallback: default to OPEN
+                    self.logger().debug(f"Fallback: Using OPEN for {trade_type.name} (position amount: {existing_position.amount})")
+                    return PositionAction.OPEN
+                    
+                except Exception as e:
+                    self.logger().warning(f"Error determining smart position action for {trading_pair}: {e}")
+                    self.logger().debug(f"Fallback: Using OPEN for {trade_type.name} due to error")
+                    return PositionAction.OPEN
+
             async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
                 """Cancels order using QTX shared memory"""
                 if self.shm_manager is not None:
@@ -298,7 +450,7 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                             return True
                         else:
                             error_msg = response_data.get("error", "Unknown error")
-                            if "not exist" in error_msg.lower() or "not found" in error_msg.lower():
+                            if self.shm_manager._is_order_not_found_error(error_msg):
                                 self.logger().debug(
                                     f"Order {order_id} does not exist on QTX. Treating as already cancelled."
                                 )
