@@ -1,1 +1,0 @@
-1. When planning to introduce self-implmemented structure or interfaces, please check if the Hummingbot did implement the necessary infrastructure and interfaces. The Hummingbot's interface is very complete, there should rarely be new structure that we should design by our own. If you really need to propose new interface/sturcture design, provide detailed explanations.
