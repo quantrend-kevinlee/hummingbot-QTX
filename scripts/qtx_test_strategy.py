@@ -1,33 +1,14 @@
-"""
-QTX Market Order Conversion Test Strategy
-
-Validates QTX's intelligent market order handling and position detection.
-
-Test Coverage:
-- Market order → Aggressive LIMIT conversion (±3% pricing)
-- Smart position action detection (auto OPEN/CLOSE)
-- Complete order lifecycle (place → fill → cancel)
-
-Expected Flow:
-1. BUY MARKET (no position) → Auto-detect OPEN → LIMIT @ ask+3%
-2. SELL MARKET (LONG exists) → Auto-detect CLOSE → LIMIT @ bid-3%
-3. Distant LIMIT order → Test order management → Cancel after timeout
-
-This proves QTX can handle real-world usage patterns where users don't 
-specify position actions and expect market orders to "just work".
-"""
-
+import asyncio
 import logging
 import time
 from decimal import Decimal
+from typing import Dict, List
 
+from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
-    MarketOrderFailureEvent,
-    OrderCancelledEvent,
-    OrderExpiredEvent,
     OrderFilledEvent,
     SellOrderCompletedEvent,
     SellOrderCreatedEvent,
@@ -35,219 +16,355 @@ from hummingbot.core.event.events import (
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
-class QTXTestStrategy(ScriptStrategyBase):
+class QtxTestStrategy(ScriptStrategyBase):
     """
-    End-to-end validation of QTX's market order intelligence.
+    Test strategy for QTX to validate order placement, cancellation, and market order handling.
     
-    Tests that users can trade naturally without understanding position actions
-    or market order limitations. QTX should "do the right thing" automatically.
+    This strategy will:
+    1. Place and cancel a LIMIT BUY order
+    2. Place and cancel a LIMIT SELL order
+    3. Place a MARKET BUY order to open a long position (and leave it open)
     """
 
-    # Key Parameters - ADJUST THESE
-    connector_name = "qtx_perpetual"  # The connector to test
-    trading_pair = "ETH-USDT"  # Trading pair to use for testing
-    order_amount = Decimal("0.015")  # Small amount to minimize risk
-    distant_order_amount = Decimal("0.01")  # Amount for distant limit order
+    # Define stages as class constants
+    STAGE_INITIALIZE = "initialize"
+    STAGE_TEST_BUY_CANCEL = "test_buy_cancel"
+    STAGE_TEST_SELL_CANCEL = "test_sell_cancel"
+    STAGE_OPEN_POSITION = "open_position"
+    STAGE_DONE = "done"
 
-    # State tracking
-    placed_market_buy = False
-    placed_market_sell = False
-    placed_distant_order = False
-    market_buy_filled = False
-    market_sell_filled = False
-    distant_order_id = None
-    distant_order_timestamp = None
-    test_complete = False
+    # Strategy parameters
+    connector_name = "qtx_perpetual"
+    trading_pair = "ETH-USDT"
+    order_amount = Decimal("0.01")  # Small amount for testing
+    limit_price_offset = Decimal("0.05")  # 5% offset for limit orders
 
-    # Tracking timestamps for delays
-    last_action_timestamp = 0
-    initialized = False
+    # Define markets as a class attribute
+    markets = {connector_name: {trading_pair}}
 
-    def __init__(self, connectors=None, config=None):
-        """
-        Initialize the strategy.
-        The connectors parameter will be passed by Hummingbot as a dict of connector names to connector instances.
-        """
-        super().__init__(connectors)  # Pass connectors to ScriptStrategyBase
-        self.last_action_timestamp = time.time()
+    # Order tracking
+    order_details: Dict[str, Dict] = {}  # Store all order details
+    cancelled_order_ids: List[str] = []
+    filled_order_ids: List[str] = []
+
+    # Stage management
+    current_stage = STAGE_INITIALIZE
+    last_action_timestamp = None
+    stage_timeout = 3  # seconds to wait between stages
+    cancel_wait_time = 2  # seconds to wait before cancelling
+
+    # Statistics
+    orders_placed = 0
+    orders_filled = 0
+    orders_cancelled = 0
+
+    # Test duration
+    test_duration = 60  # 1 minute total test duration
+    start_time = None
+    
+    # Track if we have a pending order
+    pending_order_id = None
+    pending_order_placed_time = None
 
     def on_tick(self):
-        """
-        The main logic that runs on each clock tick.
-        Implements our test flow sequentially.
-        """
-        current_time = time.time()
+        """Main strategy logic executed on each tick."""
+        # Initialize timestamps on first tick
+        if self.start_time is None:
+            self.start_time = time.time()
+        if self.last_action_timestamp is None:
+            self.last_action_timestamp = time.time()
 
-        # Initialize the exchange if not done already
-        if not self.initialized:
-            self.initialize_exchange()
+        # Check if test duration exceeded
+        if time.time() - self.start_time > self.test_duration:
+            if self.current_stage != self.STAGE_DONE:
+                self.finish_test()
             return
 
-        # Skip if not enough time has passed since last action
-        if current_time - self.last_action_timestamp < 1:  # 1 second between actions
+        # Don't process if already done
+        if self.current_stage == self.STAGE_DONE:
             return
 
-        # Step 1: Place market buy order (creates LONG position)
-        if not self.placed_market_buy:
-            self.place_market_buy_order()
-            return
-
-        # Step 2: Place market sell order (closes LONG position)
-        if self.placed_market_buy and not self.placed_market_sell and self.market_buy_filled:
-            self.place_market_sell_order()
-            return
-
-        # Step 3: Place distant limit order (tests order management)
-        if self.placed_market_sell and not self.placed_distant_order and self.market_sell_filled:
-            self.place_distant_limit_order()
-            return
-
-        # Check if distant order needs to be canceled (after 5 seconds)
-        if (self.placed_distant_order and self.distant_order_id is not None and 
-                not self.test_complete and self.distant_order_timestamp is not None):
-            # Check if order is older than 5 seconds
-            if current_time - self.distant_order_timestamp > 5:
-                self.log_with_clock(logging.INFO, f"Canceling distant order {self.distant_order_id} after 5 seconds")
-                connector = self.connectors[self.connector_name]
-                connector.cancel(self.trading_pair, self.distant_order_id)
-                # We'll wait for the cancel confirmation in did_cancel_order before completing the test
+        # Handle pending order cancellation
+        if self.pending_order_id and self.pending_order_placed_time:
+            if time.time() - self.pending_order_placed_time >= self.cancel_wait_time:
+                self.cancel_pending_order()
                 return
+
+        # Execute stage-specific logic
+        if self.current_stage == self.STAGE_INITIALIZE:
+            self.initialize_exchange()
+        elif self.current_stage == self.STAGE_TEST_BUY_CANCEL:
+            if self.check_stage_timeout() and not self.pending_order_id:
+                self.test_buy_cancel()
+        elif self.current_stage == self.STAGE_TEST_SELL_CANCEL:
+            if self.check_stage_timeout() and not self.pending_order_id:
+                self.test_sell_cancel()
+        elif self.current_stage == self.STAGE_OPEN_POSITION:
+            if self.check_stage_timeout() and not self.pending_order_id:
+                self.open_position()
+
+    def check_stage_timeout(self):
+        """Check if enough time has passed since the last action."""
+        return time.time() - self.last_action_timestamp >= self.stage_timeout
+
+    def cancel_pending_order(self):
+        """Cancel the pending order."""
+        if self.pending_order_id:
+            # Check if order is still active
+            active_orders = self.get_active_orders(self.connector_name)
+            is_still_active = any(order.client_order_id == self.pending_order_id for order in active_orders)
+            
+            if is_still_active:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Cancelling order: {self.pending_order_id}"
+                )
+                self.cancel(self.connector_name, self.trading_pair, self.pending_order_id)
                 
-        # After distant order is placed and either canceled or test completed
-        if self.placed_distant_order and not self.test_complete and self.distant_order_id is None:
-            self.log_with_clock(logging.INFO, "QTX MARKET ORDER + SMART POSITION DETECTION TEST COMPLETE!")
-            self.log_with_clock(logging.INFO, "✅ MARKET BUY order conversion tested (MARKET → aggressive LIMIT +3%)")
-            self.log_with_clock(logging.INFO, "✅ MARKET SELL order conversion tested (MARKET → aggressive LIMIT -3%)")
-            self.log_with_clock(logging.INFO, "✅ Smart position action detection tested (auto OPEN/CLOSE)")
-            self.log_with_clock(logging.INFO, "✅ Position opening and closing tested")
-            self.log_with_clock(logging.INFO, "✅ Multiple order management tested")
-            self.test_complete = True
+                # Update order status
+                if self.pending_order_id in self.order_details:
+                    self.order_details[self.pending_order_id]["status"] = "CANCELLED"
+                self.cancelled_order_ids.append(self.pending_order_id)
+                self.orders_cancelled += 1
+            else:
+                # Order is no longer active (either filled or failed)
+                if self.pending_order_id not in self.filled_order_ids:
+                    # Must have failed
+                    if self.pending_order_id in self.order_details:
+                        self.order_details[self.pending_order_id]["status"] = "FAILED"
+
+            # Reset pending order tracking
+            self.pending_order_id = None
+            self.pending_order_placed_time = None
+            
+            # Progress to next stage
+            if self.current_stage == self.STAGE_TEST_BUY_CANCEL:
+                self.current_stage = self.STAGE_TEST_SELL_CANCEL
+                self.last_action_timestamp = time.time()
+            elif self.current_stage == self.STAGE_TEST_SELL_CANCEL:
+                self.current_stage = self.STAGE_OPEN_POSITION
+                self.last_action_timestamp = time.time()
+
+    def did_fill_order(self, event: OrderFilledEvent):
+        """Handle order fill events."""
+        self.orders_filled += 1
+        self.filled_order_ids.append(event.order_id)
+        
+        # Update order details
+        if event.order_id in self.order_details:
+            self.order_details[event.order_id]["status"] = "FILLED"
+            self.order_details[event.order_id]["fill_price"] = float(event.price)
+            self.order_details[event.order_id]["fill_amount"] = float(event.amount)
+            self.order_details[event.order_id]["fee"] = str(event.trade_fee)
+        
+        if event.order_id == self.pending_order_id:
+            self.pending_order_id = None
+            self.pending_order_placed_time = None
+
+        # Progress to next stage if this was the final BUY order
+        if self.current_stage == self.STAGE_OPEN_POSITION:
+            self.log_with_clock(logging.INFO, "Final BUY order filled - Position opened")
+            self.finish_test()
+
+    def did_create_buy_order(self, event: BuyOrderCreatedEvent):
+        """Handle buy order creation events."""
+        # Store order details
+        self.order_details[event.order_id] = {
+            "order_id": event.order_id,
+            "type": "BUY",
+            "order_type": event.type.name,
+            "amount": float(event.amount),
+            "price": float(event.price) if event.type == OrderType.LIMIT else "MARKET",
+            "status": "CREATED",
+            "created_time": time.time()
+        }
+
+    def did_create_sell_order(self, event: SellOrderCreatedEvent):
+        """Handle sell order creation events."""
+        # Store order details
+        self.order_details[event.order_id] = {
+            "order_id": event.order_id,
+            "type": "SELL",
+            "order_type": event.type.name,
+            "amount": float(event.amount),
+            "price": float(event.price) if event.type == OrderType.LIMIT else "MARKET",
+            "status": "CREATED",
+            "created_time": time.time()
+        }
+
+    def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
+        """Handle buy order completion events."""
+        # This is called when an order is fully filled
+        pass
+
+    def did_complete_sell_order(self, event: SellOrderCompletedEvent):
+        """Handle sell order completion events."""
+        # This is called when an order is fully filled
+        pass
 
     def initialize_exchange(self):
-        """Set up exchange configuration for testing."""
-        if not self.connectors or self.connector_name not in self.connectors:
-            return
-
+        """Set up exchange configuration"""
         connector = self.connectors[self.connector_name]
-        if not connector.ready:
+
+        # Wait for valid prices
+        mid_price = connector.get_mid_price(self.trading_pair)
+        if mid_price is None or mid_price <= 0:
             return
 
-        # Set up ONE-WAY position mode and 1x leverage
-        self.log_with_clock(logging.INFO, f"Setting leverage to 1 for {self.trading_pair}")
+        # Configure exchange (silently)
         connector.set_leverage(self.trading_pair, 1)
-        
-        self.log_with_clock(logging.INFO, f"Setting position mode to PositionMode.ONEWAY")
-        connector.set_position_mode(PositionMode.ONEWAY)
-        
-        self.log_with_clock(logging.INFO, "Exchange configuration complete. Beginning order test sequence...")
-        self.initialized = True
+
+        # Check position mode
+        try:
+            current_mode = connector.position_mode
+            if current_mode != PositionMode.ONEWAY:
+                self.log_with_clock(
+                    logging.WARNING, 
+                    f"WARNING: Account is in {current_mode} mode. This test is designed for ONE-WAY mode!"
+                )
+        except:
+            pass
+
+        self.log_with_clock(logging.INFO, "Starting QTX order test sequence...")
+        self.current_stage = self.STAGE_TEST_BUY_CANCEL
         self.last_action_timestamp = time.time()
 
-    def place_market_buy_order(self):
-        """Place a MARKET BUY order without specifying position_action."""
+    def test_buy_cancel(self):
+        """Place a LIMIT BUY order that will be cancelled."""
         connector = self.connectors[self.connector_name]
         current_price = connector.get_mid_price(self.trading_pair)
+
+        if current_price is None or current_price <= 0:
+            return
+
+        # Place limit buy order below market price
+        limit_price = current_price * (Decimal("1") - self.limit_price_offset)
         
         self.log_with_clock(
             logging.INFO,
-            f"Placing MARKET BUY order: {self.order_amount} {self.trading_pair} (current price: {current_price})",
-        )
-
-        self.buy(
-            connector_name=self.connector_name,
-            trading_pair=self.trading_pair,
-            amount=self.order_amount,
-            order_type=OrderType.MARKET,  # Real MARKET order, no position_action
-        )
-        
-        self.placed_market_buy = True
-        self.last_action_timestamp = time.time()
-
-    def place_market_sell_order(self):
-        """Place a MARKET SELL order without specifying position_action."""
-        connector = self.connectors[self.connector_name]
-        current_price = connector.get_mid_price(self.trading_pair)
-        
-        self.log_with_clock(
-            logging.INFO,
-            f"Placing MARKET SELL order: {self.order_amount} {self.trading_pair} (current price: {current_price})",
-        )
-
-        self.sell(
-            connector_name=self.connector_name,
-            trading_pair=self.trading_pair,
-            amount=self.order_amount,
-            order_type=OrderType.MARKET,  # Real MARKET order, no position_action
-        )
-        
-        self.placed_market_sell = True
-        self.last_action_timestamp = time.time()
-
-    def place_distant_limit_order(self):
-        """Place a LIMIT order far from market to test order management."""
-        connector = self.connectors[self.connector_name]
-        current_price = connector.get_mid_price(self.trading_pair)
-        distant_price = current_price * Decimal("0.8")  # 20% below market
-        
-        self.log_with_clock(
-            logging.INFO,
-            f"Placing distant LIMIT BUY order: {self.distant_order_amount} {self.trading_pair} at {distant_price} (current: {current_price})",
+            f"Placing LIMIT BUY order at {limit_price:.2f} (will cancel in {self.cancel_wait_time}s)"
         )
 
         order_id = self.buy(
             connector_name=self.connector_name,
             trading_pair=self.trading_pair,
-            amount=self.distant_order_amount,
+            amount=self.order_amount,
             order_type=OrderType.LIMIT,
-            price=distant_price,
+            price=limit_price
         )
         
-        self.distant_order_id = order_id
-        self.distant_order_timestamp = time.time()
-        self.placed_distant_order = True
-        self.last_action_timestamp = time.time()
+        self.pending_order_id = order_id
+        self.pending_order_placed_time = time.time()
+        self.orders_placed += 1
 
-    def log_positions_status(self):
-        """Log current positions for debugging."""
+    def test_sell_cancel(self):
+        """Place a LIMIT SELL order that will be cancelled."""
         connector = self.connectors[self.connector_name]
-        positions = connector.account_positions
+        current_price = connector.get_mid_price(self.trading_pair)
+
+        if current_price is None or current_price <= 0:
+            return
+
+        # Place limit sell order above market price
+        limit_price = current_price * (Decimal("1") + self.limit_price_offset)
         
-        self.log_with_clock(logging.INFO, f"Current Positions:")
-        self.log_with_clock(logging.INFO, f"Position count: {len(positions)}")
+        self.log_with_clock(
+            logging.INFO,
+            f"Placing LIMIT SELL order at {limit_price:.2f} (will cancel in {self.cancel_wait_time}s)"
+        )
+
+        order_id = self.sell(
+            connector_name=self.connector_name,
+            trading_pair=self.trading_pair,
+            amount=self.order_amount,
+            order_type=OrderType.LIMIT,
+            price=limit_price
+        )
         
-        if positions:
-            for position_key, position in positions.items():
-                pnl_pct = (position.unrealized_pnl / position.entry_price) * 100 if position.entry_price > 0 else 0
-                self.log_with_clock(logging.INFO, f"  {position}")
-                self.log_with_clock(logging.INFO, f"  PnL %: {pnl_pct:.2f}%")
-        else:
-            self.log_with_clock(logging.INFO, f"  No open positions")
+        self.pending_order_id = order_id
+        self.pending_order_placed_time = time.time()
+        self.orders_placed += 1
 
-    # Event Handlers - track order lifecycle
-    def did_create_buy_order(self, event: BuyOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"Created BUY order {event.order_id}")
+    def open_position(self):
+        """Place a MARKET BUY order to open a position."""
+        connector = self.connectors[self.connector_name]
+        current_price = connector.get_mid_price(self.trading_pair)
 
-    def did_create_sell_order(self, event: SellOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"Created SELL order {event.order_id}")
+        if current_price is None or current_price <= 0:
+            return
 
-    def did_fill_order(self, event: OrderFilledEvent):
-        self.log_with_clock(logging.INFO, f"Order filled: {event.trade_type.name} {event.amount} of {event.trading_pair} at {event.price}")
+        self.log_with_clock(
+            logging.INFO,
+            f"Placing MARKET BUY order to open position"
+        )
+
+        order_id = self.buy(
+            connector_name=self.connector_name,
+            trading_pair=self.trading_pair,
+            amount=self.order_amount,
+            order_type=OrderType.MARKET
+        )
         
-        if event.trade_type == TradeType.BUY and not self.market_buy_filled:
-            self.market_buy_filled = True
-        elif event.trade_type == TradeType.SELL and not self.market_sell_filled:
-            self.market_sell_filled = True
+        self.pending_order_id = order_id
+        self.orders_placed += 1
 
-    def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
-        self.log_with_clock(logging.INFO, f"Buy order {event.order_id} completed")
+    def finish_test(self):
+        """Complete the test and show detailed statistics."""
+        self.current_stage = self.STAGE_DONE
 
-    def did_complete_sell_order(self, event: SellOrderCompletedEvent):
-        self.log_with_clock(logging.INFO, f"Sell order {event.order_id} completed")
+        # Get final position
+        try:
+            connector = self.connectors[self.connector_name]
+            positions = connector.account_positions
+            position_info = "No open positions"
+            
+            if positions:
+                for key, position in positions.items():
+                    if hasattr(position, 'amount') and position.amount != 0:
+                        side = "LONG" if position.amount > 0 else "SHORT"
+                        position_info = f"{side} {abs(position.amount)} {key} @ {getattr(position, 'entry_price', 'N/A')}"
+                        break
+        except:
+            position_info = "Could not retrieve position"
 
-    def did_cancel_order(self, event: OrderCancelledEvent):
-        self.log_with_clock(logging.INFO, f"Cancelled order {event.order_id}")
-        if event.order_id == self.distant_order_id:
-            self.distant_order_id = None  # Mark as cancelled
+        # Build detailed summary
+        self.log_with_clock(
+            logging.INFO,
+            f"\n{'='*60}\n"
+            f"QTX ORDER TEST COMPLETED\n"
+            f"{'='*60}\n"
+            f"Test Duration: {time.time() - self.start_time:.1f} seconds\n"
+            f"Final Position: {position_info}\n"
+            f"\nOrder Summary:\n"
+            f"  Total Orders Placed: {self.orders_placed}\n"
+            f"  Orders Filled: {self.orders_filled}\n"
+            f"  Orders Cancelled: {self.orders_cancelled}\n"
+            f"\nOrder Details:"
+        )
 
-    def did_fail_order(self, event: MarketOrderFailureEvent):
-        self.log_with_clock(logging.ERROR, f"Order {event.order_id} failed")
+        # Log each order's details
+        for order_id, details in self.order_details.items():
+            status_emoji = {
+                "FILLED": "✅",
+                "CANCELLED": "❌",
+                "FAILED": "⚠️",
+                "CREATED": "⏳"
+            }.get(details["status"], "❓")
+            
+            order_info = (
+                f"\n  {status_emoji} Order #{order_id[-6:]}: {details['type']} {details['order_type']} "
+                f"{details['amount']} ETH @ {details['price']}"
+            )
+            
+            if details["status"] == "FILLED":
+                order_info += f" -> Filled @ {details.get('fill_price', 'N/A')}"
+                if "fee" in details:
+                    order_info += f" (Fee: {details['fee']})"
+            elif details["status"] == "CANCELLED":
+                order_info += " -> Cancelled"
+            elif details["status"] == "FAILED":
+                order_info += " -> Failed"
+                
+            self.log_with_clock(logging.INFO, order_info)
+
+        self.log_with_clock(logging.INFO, f"\n{'='*60}")

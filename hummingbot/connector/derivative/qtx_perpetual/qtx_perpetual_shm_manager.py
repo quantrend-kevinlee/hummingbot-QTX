@@ -34,10 +34,11 @@ QTX_ORDER_TYPE_FOK = 3          # Fill or Kill
 QTX_SIDE_BUY = 1
 QTX_SIDE_SELL = -1
 
-# Position side constants (ONE-WAY mode - QTX default)
-QTX_POS_SIDE_LONG = 1
-QTX_POS_SIDE_BOTH = 0           # ONE-WAY mode (default for QTX)
-QTX_POS_SIDE_SHORT = -1
+# Position side constants
+# NOTE: QTX only supports ONE-WAY mode - pos_side must always be BOTH (0)
+QTX_POS_SIDE_LONG = 1           # Not used in ONE-WAY mode
+QTX_POS_SIDE_BOTH = 0           # ONE-WAY mode (required for all QTX orders)
+QTX_POS_SIDE_SHORT = -1         # Not used in ONE-WAY mode
 
 # Price matching strategy constants
 QTX_PRICE_MATCH_NONE = 0        # Use exact price
@@ -61,20 +62,15 @@ def _translate_position_side(position_action: PositionAction, trade_type: TradeT
     """
     Maps position intent to QTX's ONE-WAY mode position side encoding.
     
-    Critical: In ONE-WAY mode, pos_side indicates *which position you're affecting*,
-    not the direction you're trading. This is counterintuitive but correct:
+    In ONE-WAY mode, pos_side must ALWAYS be BOTH (0).
+    The exchange automatically determines whether an order opens or closes
+    a position based on the current position state and trade direction.
     
-    Opening positions: pos_side = direction of new position
-    Closing positions: pos_side = direction of existing position being closed
+    BUY orders: Open/increase long position OR close/reduce short position
+    SELL orders: Open/increase short position OR close/reduce long position
     """
-    if position_action == PositionAction.OPEN:
-        return QTX_POS_SIDE_LONG if trade_type == TradeType.BUY else QTX_POS_SIDE_SHORT
-    elif position_action == PositionAction.CLOSE:
-        # When closing, specify the position you're closing (opposite of trade direction)
-        return QTX_POS_SIDE_SHORT if trade_type == TradeType.BUY else QTX_POS_SIDE_LONG
-    else:
-        # NIL defaults to OPEN behavior (fallback for smart position detection)
-        return QTX_POS_SIDE_LONG if trade_type == TradeType.BUY else QTX_POS_SIDE_SHORT
+    # In ONE-WAY mode, always use BOTH regardless of position action or trade type
+    return QTX_POS_SIDE_BOTH
 
 
 def _translate_order_type(order_type: OrderType) -> int:

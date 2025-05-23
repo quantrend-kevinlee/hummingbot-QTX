@@ -216,10 +216,15 @@ def main():
                     logging.warning(f"Ignoring response from unexpected address: {addr}")
                     continue
 
-                # try decode as ASCII index
+                # try decode as ASCII index:symbol response
                 try:
-                    index = int(response.decode("utf-8").strip())
-                    logging.info(f"Got text ACK {index} for {symbol}")
+                    response_str = response.decode("utf-8").strip()
+                    # Parse new format: "index:symbol" (e.g., "9:binance-futures:ethusdt")
+                    index_str, returned_symbol = response_str.split(":", 1)
+                    index = int(index_str)
+                    logging.info(f"Got text ACK {index}:{returned_symbol} for {symbol}")
+                    if returned_symbol != symbol:
+                        logging.warning(f"Subscribed to {symbol} but received confirmation for {returned_symbol}")
                     break
                 except (UnicodeDecodeError, ValueError):
                     # Try to determine if this is a market data message
