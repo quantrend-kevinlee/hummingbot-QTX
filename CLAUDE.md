@@ -77,6 +77,8 @@ python test/hummingbot/connector/derivative/qtx_perpetual/qtx_enhanced_udp_logge
 
 ### Testing
 
+We use unittest, not pytest.
+
 ```bash
 # Run all tests
 python -m unittest discover -s test/hummingbot/connector/derivative/qtx_perpetual
