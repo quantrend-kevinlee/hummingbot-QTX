@@ -6,15 +6,15 @@ Unit tests for QtxPerpetualUDPManager with the real QTX UDP server
 
 import asyncio
 import time
-import unittest
-from typing import Optional, Dict
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from typing import Dict, Optional
 
-from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_udp_manager import QtxPerpetualUDPManager
 from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_constants as CONSTANTS
+from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_udp_manager import QtxPerpetualUDPManager
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 
 
-class QtxPerpetualUDPManagerRealServerTests(unittest.IsolatedAsyncioTestCase):
+class QtxPerpetualUDPManagerRealServerTests(IsolatedAsyncioWrapperTestCase):
     """Test cases for the QtxPerpetualUDPManager that connect to the real QTX UDP server"""
 
     # Configuration
@@ -415,27 +415,41 @@ class QtxPerpetualUDPManagerRealServerTests(unittest.IsolatedAsyncioTestCase):
         
         # Create tasks to consume from both queues
         async def consume_diff():
-            while True:
+            end_time = asyncio.get_event_loop().time() + self.message_wait_time
+            while asyncio.get_event_loop().time() < end_time:
                 try:
                     message = await asyncio.wait_for(diff_queue.get(), timeout=0.1)
                     messages_by_type[OrderBookMessageType.DIFF].append(message)
                 except asyncio.TimeoutError:
-                    break
+                    continue
         
         async def consume_trade():
-            while True:
+            end_time = asyncio.get_event_loop().time() + self.message_wait_time
+            while asyncio.get_event_loop().time() < end_time:
                 try:
                     message = await asyncio.wait_for(trade_queue.get(), timeout=0.1)
                     messages_by_type[OrderBookMessageType.TRADE].append(message)
                 except asyncio.TimeoutError:
-                    break
+                    continue
         
-        # Run consumers for a period
-        await asyncio.gather(
-            asyncio.create_task(consume_diff()),
-            asyncio.create_task(consume_trade()),
-            asyncio.sleep(self.message_wait_time)
-        )
+        # Create and run consumer tasks
+        diff_task = asyncio.create_task(consume_diff())
+        trade_task = asyncio.create_task(consume_trade())
+        
+        # Wait for consumers to finish with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(diff_task, trade_task),
+                timeout=self.message_wait_time + 1.0
+            )
+        except asyncio.TimeoutError:
+            # Cancel tasks if they don't finish in time
+            diff_task.cancel()
+            trade_task.cancel()
+            try:
+                await asyncio.gather(diff_task, trade_task)
+            except asyncio.CancelledError:
+                pass
         
         total_messages = sum(len(msgs) for msgs in messages_by_type.values())
         self.logger.info(f"✓ Received {total_messages} total messages for {self.trading_pair}")
@@ -534,7 +548,7 @@ class QtxPerpetualUDPManagerRealServerTests(unittest.IsolatedAsyncioTestCase):
             while not diff_queue.empty():
                 await diff_queue.get()
                 messages_consumed += 1
-        except:
+        except Exception:
             pass
         
         self.logger.info(f"✓ Queue overflow handled gracefully, consumed {messages_consumed} backlogged messages")

@@ -5,23 +5,25 @@ Edge case and performance tests for QtxPerpetualUDPManager
 """
 
 import asyncio
+import socket
 import struct
+import sys
 import time
 import unittest
-from unittest.mock import MagicMock, patch, AsyncMock
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Dict, List, Optional
-import socket
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_constants as CONSTANTS
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_udp_manager import (
+    ConnectionState,
     QtxPerpetualUDPManager,
     SubscriptionState,
-    ConnectionState
 )
-from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_constants as CONSTANTS
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 
 
-class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
+class QtxPerpetualUDPManagerEdgeCaseTests(IsolatedAsyncioWrapperTestCase):
     """Edge case tests for the QtxPerpetualUDPManager"""
 
     async def asyncSetUp(self) -> None:
@@ -81,7 +83,7 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         mock_socket.sendto = MagicMock(side_effect=socket.timeout("Connection timed out"))
         mock_socket_class.return_value = mock_socket
         
-        # Add timeout protection to ensure test doesn't hang
+        # Test connection with timeout protection
         try:
             connected = await asyncio.wait_for(self.udp_manager.connect(), timeout=5.0)
         except asyncio.TimeoutError:
@@ -107,10 +109,13 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
             # Valid header but incomplete body for ticker
             struct.pack("<iiqqqq", 1, 100, 12345, timestamp_ns, timestamp_ns, timestamp_ns) + b"SHORT",
             # Unknown message type
-            struct.pack("<iiqqqq", 999, 100, 12345, timestamp_ns, timestamp_ns, timestamp_ns) + struct.pack("<dd", 50000.0, 1.0),
+            struct.pack("<iiqqqq", 999, 100, 12345, timestamp_ns, timestamp_ns, timestamp_ns) + 
+            struct.pack("<dd", 50000.0, 1.0),
         ]
         
-        mock_socket.recvfrom = MagicMock(side_effect=[(msg, ("127.0.0.1", 8080)) for msg in malformed_messages])
+        mock_socket.recvfrom = MagicMock(
+            side_effect=[(msg, ("127.0.0.1", 8080)) for msg in malformed_messages]
+        )
         mock_socket_class.return_value = mock_socket
         
         await self.udp_manager.connect()
@@ -164,7 +169,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         index_counter = 100
         def mock_recvfrom(*args):
             nonlocal index_counter
-            # Use new format: "index:symbol"
             response = f"{index_counter}:binance-futures:btcusdt".encode("utf-8")
             index_counter += 1
             return (response, ("127.0.0.1", 8080))
@@ -194,7 +198,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         index_counter = 100
         def mock_recvfrom(*args):
             nonlocal index_counter
-            # Use new format: "index:symbol" - use generic symbol for this test
             response = f"{index_counter}:binance-futures:symbol".encode("utf-8")
             index_counter += 1
             return (response, ("127.0.0.1", 8080))
@@ -237,7 +240,10 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         
         # Process 1000 ticker messages
         for i in range(1000):
-            header = struct.pack("<iiqqqq", 1, 100, i, timestamp_ns + i * 1000, timestamp_ns + i * 1000, timestamp_ns + i * 1000)
+            header = struct.pack(
+                "<iiqqqq", 1, 100, i, 
+                timestamp_ns + i * 1000, timestamp_ns + i * 1000, timestamp_ns + i * 1000
+            )
             body = struct.pack("<dd", 50000.0 + i, 1.0 + i * 0.1)
             message_data = header + body
             
@@ -254,7 +260,9 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed_messages, 1000)
         
         rate = processed_messages / processing_time if processing_time > 0 else 0
-        self.logger.info(f"Processed {processed_messages} messages in {processing_time:.3f}s ({rate:.0f} msg/s)")
+        self.logger.info(
+            f"Processed {processed_messages} messages in {processing_time:.3f}s ({rate:.0f} msg/s)"
+        )
         
         self.assertGreater(rate, 1000)
     
@@ -268,7 +276,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         index_counter = 100
         def mock_recvfrom(*args):
             nonlocal index_counter
-            # Use new format: "index:symbol" - use generic symbol for this test
             response = f"{index_counter}:binance-futures:symbol".encode("utf-8")
             index_counter += 1
             return (response, ("127.0.0.1", 8080))
@@ -276,7 +283,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         mock_socket.recvfrom = MagicMock(side_effect=mock_recvfrom)
         
         with patch('socket.socket', return_value=mock_socket):
-            # Add timeout protection to connection operations
             await asyncio.wait_for(self.udp_manager.connect(), timeout=5.0)
             self.udp_manager._connection_state.is_connected = True
             
@@ -334,7 +340,7 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Invalid message_type", str(e))
         
         try:
-            self.udp_manager.get_message_queue("BTC-USDT", "snapshot")  # No longer supported
+            self.udp_manager.get_message_queue("BTC-USDT", "snapshot")
             self.fail("Should have raised ValueError for snapshot message type")
         except ValueError as e:
             self.assertIn("Invalid message_type", str(e))
@@ -346,25 +352,30 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         messages = []
         timestamp_ns = int(time.time() * 1e9)
         
+        # Generate test messages
         for i in range(2000):
             if i % 3 == 0:
                 # Ticker message
-                msg_data = struct.pack("<iiqqqq", 
-                    1, 100, i, timestamp_ns, timestamp_ns + 1000, timestamp_ns + 2000) + \
-                    struct.pack("<dd", 50000.0 + i * 0.1, 1.0 + i * 0.01)
+                msg_data = struct.pack(
+                    "<iiqqqq", 
+                    1, 100, i, timestamp_ns, timestamp_ns + 1000, timestamp_ns + 2000
+                ) + struct.pack("<dd", 50000.0 + i * 0.1, 1.0 + i * 0.01)
                 messages.append(msg_data)
             elif i % 3 == 1:
                 # Depth message
-                header = struct.pack("<iiqqqq", 2, 100, i, timestamp_ns, timestamp_ns + 1000, timestamp_ns + 2000)
+                header = struct.pack(
+                    "<iiqqqq", 2, 100, i, timestamp_ns, timestamp_ns + 1000, timestamp_ns + 2000
+                )
                 counts = struct.pack("<qq", 2, 2)
                 asks = struct.pack("<dd", 50001.0, 1.0) + struct.pack("<dd", 50002.0, 2.0)
                 bids = struct.pack("<dd", 49999.0, 1.0) + struct.pack("<dd", 49998.0, 2.0)
                 messages.append(header + counts + asks + bids)
             else:
                 # Trade message
-                msg_data = struct.pack("<iiqqqq", 
-                    3, 100, i, timestamp_ns, timestamp_ns + 1000, timestamp_ns + 2000) + \
-                    struct.pack("<dd", 50000.0, 0.5)
+                msg_data = struct.pack(
+                    "<iiqqqq", 
+                    3, 100, i, timestamp_ns, timestamp_ns + 1000, timestamp_ns + 2000
+                ) + struct.pack("<dd", 50000.0, 0.5)
                 messages.append(msg_data)
         
         self.udp_manager._subscriptions["BTC-USDT"] = SubscriptionState(
@@ -386,23 +397,21 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         
         elapsed = time.time() - start_time
         
-        # Count processed messages (only diff and trade messages go to queues)
+        # Count processed messages
         diff_count = diff_queue.qsize()
         trade_count = trade_queue.qsize()
         total_processed = diff_count + trade_count
         
         # Calculate expected queued messages accounting for queue capacity limits
-        # - Ticker (type 1, i % 3 == 0) and depth (type 2, i % 3 == 1) messages go to diff queue (maxsize=1000)
-        # - Trade (type 3, i % 3 == 2) messages go to trade queue (maxsize=1000)
-        expected_diff_total = len([i for i in range(len(messages)) if i % 3 in [0, 1]])  # ticker + depth messages
-        expected_trade_total = len([i for i in range(len(messages)) if i % 3 == 2])  # trade messages  
+        expected_diff_total = len([i for i in range(len(messages)) if i % 3 in [0, 1]])
+        expected_trade_total = len([i for i in range(len(messages)) if i % 3 == 2])
         
         # Account for queue size limits
-        expected_diff = min(expected_diff_total, 1000)  # diff queue maxsize
-        expected_trade = min(expected_trade_total, 1000)  # trade queue maxsize
+        expected_diff = min(expected_diff_total, 1000)
+        expected_trade = min(expected_trade_total, 1000)
         expected_queued = expected_diff + expected_trade
         
-        rate = len(messages) / elapsed if elapsed > 0 else 0  # Rate based on all messages processed
+        rate = len(messages) / elapsed if elapsed > 0 else 0
         avg_time = elapsed / len(messages) * 1000000 if len(messages) > 0 else 0
         
         self.logger.info(f"\nMessage Parsing Performance:")
@@ -426,7 +435,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         index_counter = 100
         def mock_recvfrom(*args):
             nonlocal index_counter
-            # Use new format: "index:symbol" - use generic symbol for this test
             response = f"{index_counter}:binance-futures:symbol".encode("utf-8")
             index_counter += 1
             return (response, ("127.0.0.1", 8080))
@@ -459,8 +467,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
     
     async def test_memory_efficiency(self):
         """Test memory efficiency with many subscriptions"""
-        import sys
-        
         mock_socket = MagicMock()
         mock_socket.setblocking = MagicMock()
         mock_socket.settimeout = MagicMock()
@@ -469,7 +475,6 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         index_counter = 100
         def mock_recvfrom(*args):
             nonlocal index_counter
-            # Use new format: "index:symbol" - use generic symbol for this test
             response = f"{index_counter}:binance-futures:symbol".encode("utf-8")
             index_counter += 1
             return (response, ("127.0.0.1", 8080))
@@ -501,7 +506,9 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
         mock_socket.setblocking = MagicMock()
         mock_socket.settimeout = MagicMock()
         mock_socket.sendto = MagicMock(return_value=10)
-        mock_socket.recvfrom = MagicMock(return_value=(b"100:binance-futures:btcusdt", ("127.0.0.1", 8080)))
+        mock_socket.recvfrom = MagicMock(
+            return_value=(b"100:binance-futures:btcusdt", ("127.0.0.1", 8080))
+        )
         
         with patch('socket.socket', return_value=mock_socket):
             await self.udp_manager.connect()
@@ -533,12 +540,12 @@ class QtxPerpetualUDPManagerEdgeCaseTests(unittest.IsolatedAsyncioTestCase):
             self.logger.info(f"  Bids: {len(snapshot['bids'])}")
             self.logger.info(f"  Asks: {len(snapshot['asks'])}")
             
-            self.assertLess(elapsed, 2.0)  # Should complete within 2 seconds
+            self.assertLess(elapsed, 2.0)
             self.assertGreater(len(snapshot['bids']), 0)
             self.assertGreater(len(snapshot['asks']), 0)
 
 
-class QtxPerpetualUDPManagerStressTests(unittest.IsolatedAsyncioTestCase):
+class QtxPerpetualUDPManagerStressTests(IsolatedAsyncioWrapperTestCase):
     """Stress tests for the QtxPerpetualUDPManager"""
     
     async def asyncSetUp(self) -> None:
@@ -559,6 +566,7 @@ class QtxPerpetualUDPManagerStressTests(unittest.IsolatedAsyncioTestCase):
     
     async def test_sustained_high_throughput(self):
         """Test sustained high throughput message processing"""
+        # Set up subscriptions
         for i in range(10):
             index = 100 + i
             pair = f"TOKEN{i}-USDT"
@@ -588,22 +596,28 @@ class QtxPerpetualUDPManagerStressTests(unittest.IsolatedAsyncioTestCase):
             
             if msg_count % 3 == 0:
                 # Ticker
-                header = struct.pack("<iiqqqq", 1, index, msg_count, 
-                                   timestamp_ns, timestamp_ns, timestamp_ns)
+                header = struct.pack(
+                    "<iiqqqq", 1, index, msg_count, 
+                    timestamp_ns, timestamp_ns, timestamp_ns
+                )
                 body = struct.pack("<dd", 50000.0 + msg_count * 0.1, 1.0)
                 message_data = header + body
             elif msg_count % 3 == 1:
                 # Depth
-                header = struct.pack("<iiqqqq", 2, index, msg_count, 
-                                   timestamp_ns, timestamp_ns, timestamp_ns)
+                header = struct.pack(
+                    "<iiqqqq", 2, index, msg_count, 
+                    timestamp_ns, timestamp_ns, timestamp_ns
+                )
                 counts = struct.pack("<qq", 1, 1)
                 asks = struct.pack("<dd", 50001.0, 1.0)
                 bids = struct.pack("<dd", 49999.0, 1.0)
                 message_data = header + counts + asks + bids
             else:
                 # Trade
-                header = struct.pack("<iiqqqq", 3, index, msg_count, 
-                                   timestamp_ns, timestamp_ns, timestamp_ns)
+                header = struct.pack(
+                    "<iiqqqq", 3, index, msg_count, 
+                    timestamp_ns, timestamp_ns, timestamp_ns
+                )
                 body = struct.pack("<dd", 50000.0, 0.5)
                 message_data = header + body
             
