@@ -23,7 +23,7 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 if TYPE_CHECKING:
     from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
-# Exchange connector mapping
+# Exchange connector mapping for supported exchanges
 EXCHANGE_CONNECTOR_CLASSES = {
     "binance": {
         "module": "hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative",
@@ -35,10 +35,25 @@ EXCHANGE_CONNECTOR_CLASSES = {
         "class": "OkxPerpetualDerivative",
         "exchange_name_on_qtx": "okx-futures",
     },
+    "bitget": {
+        "module": "hummingbot.connector.derivative.bitget_perpetual.bitget_perpetual_derivative",
+        "class": "BitgetPerpetualDerivative",
+        "exchange_name_on_qtx": "bitget-futures",
+    },
     "bybit": {
         "module": "hummingbot.connector.derivative.bybit_perpetual.bybit_perpetual_derivative",
         "class": "BybitPerpetualDerivative",
         "exchange_name_on_qtx": "bybit-futures",
+    },
+    "kucoin": {
+        "module": "hummingbot.connector.derivative.kucoin_perpetual.kucoin_perpetual_derivative",
+        "class": "KucoinPerpetualDerivative",
+        "exchange_name_on_qtx": "kucoin-futures",
+    },
+    "gate_io": {
+        "module": "hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_derivative",
+        "class": "GateIoPerpetualDerivative",
+        "exchange_name_on_qtx": "gate-io-futures",
     },
 }
 
@@ -57,11 +72,10 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
         qtx_perpetual_host: str = None,
         qtx_perpetual_port: int = None,
         exchange_backend: str = None,
-        exchange_api_key: str = None,
-        exchange_api_secret: str = None,
         qtx_place_order_shared_memory_name: str = None,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
+        **kwargs  # Accept all exchange-specific fields
     ):
         """Creates dynamic connector with specified exchange backend"""
         # Validate required parameters
@@ -71,15 +85,10 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             raise ValueError("qtx_perpetual_host is required")
         if not qtx_perpetual_port:
             raise ValueError("qtx_perpetual_port is required")
-        # API keys are only required when trading is required
-        if trading_required:
-            if not exchange_api_key:
-                raise ValueError("exchange_api_key is required for trading")
-            if not exchange_api_secret:
-                raise ValueError("exchange_api_secret is required for trading")
+        
         # Get the exchange connector class dynamically
         if exchange_backend.lower() not in EXCHANGE_CONNECTOR_CLASSES:
-            raise ValueError(f"Unsupported exchange backend: {exchange_backend}")
+            raise ValueError(f"Unsupported exchange backend: {exchange_backend}. Supported: {', '.join(EXCHANGE_CONNECTOR_CLASSES.keys())}")
         exchange_info = EXCHANGE_CONNECTOR_CLASSES[exchange_backend.lower()]
         module = importlib.import_module(exchange_info["module"])
         base_exchange_class = getattr(module, exchange_info["class"])
@@ -106,9 +115,28 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
                 # Managers (created lazily)
                 self._udp_manager = None
                 self._shm_manager = None
-                # Store API keys for later use
-                self._exchange_api_key = kwargs.pop("exchange_api_key", exchange_api_key)
-                self._exchange_api_secret = kwargs.pop("exchange_api_secret", exchange_api_secret)
+                
+                # Extract exchange API credentials for SHM manager
+                # These are stored for later use by the SHM manager
+                if self._exchange_backend == "binance":
+                    self._exchange_api_key = kwargs.get("binance_perpetual_api_key")
+                    self._exchange_api_secret = kwargs.get("binance_perpetual_api_secret")
+                elif self._exchange_backend == "okx":
+                    self._exchange_api_key = kwargs.get("okx_perpetual_api_key")
+                    self._exchange_api_secret = kwargs.get("okx_perpetual_secret_key")
+                elif self._exchange_backend == "bitget":
+                    self._exchange_api_key = kwargs.get("bitget_perpetual_api_key")
+                    self._exchange_api_secret = kwargs.get("bitget_perpetual_secret_key")
+                elif self._exchange_backend == "bybit":
+                    self._exchange_api_key = kwargs.get("bybit_perpetual_api_key")
+                    self._exchange_api_secret = kwargs.get("bybit_perpetual_secret_key")
+                elif self._exchange_backend == "kucoin":
+                    self._exchange_api_key = kwargs.get("kucoin_perpetual_api_key")
+                    self._exchange_api_secret = kwargs.get("kucoin_perpetual_secret_key")
+                elif self._exchange_backend == "gate_io":
+                    self._exchange_api_key = kwargs.get("gate_io_perpetual_api_key")
+                    self._exchange_api_secret = kwargs.get("gate_io_perpetual_secret_key")
+                
                 # Call parent constructor with appropriate parameters
                 super().__init__(*args, **kwargs)
                 # Override the exchange name to be QTX
@@ -732,16 +760,53 @@ class QtxPerpetualDerivative(PerpetualDerivativePyBase):
             "qtx_perpetual_port": qtx_perpetual_port,
             "qtx_place_order_shared_memory_name": qtx_place_order_shared_memory_name,
             "exchange_backend": exchange_backend,
-            "exchange_api_key": exchange_api_key,
-            "exchange_api_secret": exchange_api_secret,
         }
-        # Add exchange-specific parameters
+        
+        # Add exchange-specific parameters based on the selected backend
+        # Extract these from kwargs and map to the correct parameter names
         if exchange_backend.lower() == "binance":
-            # Only pass API keys if they are not None
-            if exchange_api_key is not None:
-                init_params["binance_perpetual_api_key"] = exchange_api_key
-            if exchange_api_secret is not None:
-                init_params["binance_perpetual_api_secret"] = exchange_api_secret
-        # Add other exchanges here as needed
+            if "binance_perpetual_api_key" in kwargs:
+                init_params["binance_perpetual_api_key"] = kwargs["binance_perpetual_api_key"]
+            if "binance_perpetual_api_secret" in kwargs:
+                init_params["binance_perpetual_api_secret"] = kwargs["binance_perpetual_api_secret"]
+                
+        elif exchange_backend.lower() == "okx":
+            if "okx_perpetual_api_key" in kwargs:
+                init_params["okx_perpetual_api_key"] = kwargs["okx_perpetual_api_key"]
+            if "okx_perpetual_secret_key" in kwargs:
+                init_params["okx_perpetual_secret_key"] = kwargs["okx_perpetual_secret_key"]
+            if "okx_perpetual_passphrase" in kwargs:
+                init_params["okx_perpetual_passphrase"] = kwargs["okx_perpetual_passphrase"]
+                
+        elif exchange_backend.lower() == "bitget":
+            if "bitget_perpetual_api_key" in kwargs:
+                init_params["bitget_perpetual_api_key"] = kwargs["bitget_perpetual_api_key"]
+            if "bitget_perpetual_secret_key" in kwargs:
+                init_params["bitget_perpetual_secret_key"] = kwargs["bitget_perpetual_secret_key"]
+            if "bitget_perpetual_passphrase" in kwargs:
+                init_params["bitget_perpetual_passphrase"] = kwargs["bitget_perpetual_passphrase"]
+                
+        elif exchange_backend.lower() == "bybit":
+            if "bybit_perpetual_api_key" in kwargs:
+                init_params["bybit_perpetual_api_key"] = kwargs["bybit_perpetual_api_key"]
+            if "bybit_perpetual_secret_key" in kwargs:
+                init_params["bybit_perpetual_secret_key"] = kwargs["bybit_perpetual_secret_key"]
+                
+        elif exchange_backend.lower() == "kucoin":
+            if "kucoin_perpetual_api_key" in kwargs:
+                init_params["kucoin_perpetual_api_key"] = kwargs["kucoin_perpetual_api_key"]
+            if "kucoin_perpetual_secret_key" in kwargs:
+                init_params["kucoin_perpetual_secret_key"] = kwargs["kucoin_perpetual_secret_key"]
+            if "kucoin_perpetual_passphrase" in kwargs:
+                init_params["kucoin_perpetual_passphrase"] = kwargs["kucoin_perpetual_passphrase"]
+                
+        elif exchange_backend.lower() == "gate_io":
+            if "gate_io_perpetual_api_key" in kwargs:
+                init_params["gate_io_perpetual_api_key"] = kwargs["gate_io_perpetual_api_key"]
+            if "gate_io_perpetual_secret_key" in kwargs:
+                init_params["gate_io_perpetual_secret_key"] = kwargs["gate_io_perpetual_secret_key"]
+            if "gate_io_perpetual_user_id" in kwargs:
+                init_params["gate_io_perpetual_user_id"] = kwargs["gate_io_perpetual_user_id"]
+        
         # Create and return an instance of the dynamic class
         return QtxDynamicConnector(**init_params)
