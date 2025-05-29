@@ -1,752 +1,712 @@
+#!/usr/bin/env python
+"""
+Integration test for QTX perpetual's order book data source functionality.
+
+This tests the integration between QtxPerpetualUDPManager and Hummingbot's core
+order book tracking system through the dynamically overridden data source methods.
+"""
 import asyncio
+import importlib
 import struct
 import time
-import unittest
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Dict, List, Optional
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
-# numpy as np # F401 Unused import (Removed)
-# from typing import List, Optional # F401 Unused import (Removed)
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+
 from hummingbot.connector.derivative.qtx_perpetual import qtx_perpetual_constants as CONSTANTS
-from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_api_order_book_data_source import (
-    QtxPerpetualAPIOrderBookDataSource,
+from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_derivative import (
+    EXCHANGE_CONNECTOR_CLASSES,
+    QtxPerpetualDerivative
 )
 from hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_udp_manager import QtxPerpetualUDPManager
-from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
-from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
-from hummingbot.core.data_type.funding_info import FundingInfo
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book import OrderBook
-from hummingbot.core.data_type.order_book_message import OrderBookMessage
-from hummingbot.core.data_type.order_book_row import OrderBookRow
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 
 
-import pytest
+# Test configuration - centralized for easy modification
+TEST_UDP_HOST = CONSTANTS.DEFAULT_UDP_HOST
+TEST_UDP_PORT = CONSTANTS.DEFAULT_UDP_PORT
 
 
-class TestQtxPerpetualAPIOrderBookDataSource(unittest.TestCase):
-    # Log level settings
-    level = 0
+class MockUDPSocket:
+    """Mock UDP socket for testing"""
+    def __init__(self):
+        self.sent_data = []
+        self.receive_buffer = []
+        self.closed = False
+        self._auto_respond = True
+        
+    def sendto(self, data: bytes, address):
+        self.sent_data.append((data, address))
+        
+        # Auto-respond to certain messages
+        if self._auto_respond:
+            decoded = data.decode('utf-8')
+            if decoded == "ping":
+                # Respond with pong
+                self.receive_buffer.append((b"pong", address))
+            elif decoded.startswith(("binance-futures:", "okx-futures:", "bitget-futures:", 
+                                     "bybit-futures:", "kucoin-futures:", "gate-io-futures:")):
+                # Simulate subscription ACK with index
+                index = len([d for d in self.sent_data if any(prefix in d[0] for prefix in 
+                            [b"binance-futures:", b"okx-futures:", b"bitget-futures:", 
+                             b"bybit-futures:", b"kucoin-futures:", b"gate-io-futures:"])])
+                response = struct.pack("<I", index)  # Pack index as uint32
+                self.receive_buffer.append((response, address))
+        
+    def recvfrom(self, buffer_size):
+        if self.receive_buffer:
+            return self.receive_buffer.pop(0)
+        raise BlockingIOError()
+        
+    def setblocking(self, blocking: bool):
+        pass
+        
+    def settimeout(self, timeout: float):
+        pass
+        
+    def close(self):
+        self.closed = True
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
 
+class TestQtxPerpetualOrderBookDataSourceIntegration(IsolatedAsyncioWrapperTestCase):
+    """Integration tests for QTX perpetual order book data source functionality"""
+    
+    async def _reset_udp_manager(self):
+        """Reset the UDP manager singleton for clean tests"""
+        manager = await QtxPerpetualUDPManager.get_instance()
+        if manager._connection_state.is_connected:
+            await manager.stop()
+        
+        manager._subscriptions.clear()
+        manager._index_to_pair.clear()
+        manager._message_queues.clear()
+        manager._last_update_id.clear()
+    
     def setUp(self):
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        super().setUp()
         self.trading_pair = "BTC-USDT"
-        self.qtx_trading_pair = "binance-futures:btcusdt"
-
-        self.network_assistant = NetworkMockingAssistant()
-
-        self.throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
-
-        # Create the UDP manager
-        self.udp_manager = QtxPerpetualUDPManager(host="172.30.2.221", port=8080)
-
-        self.data_source = QtxPerpetualAPIOrderBookDataSource(
+        self.exchange_backend = "binance"
+        
+        # Reset UDP Manager
+        self.run_async_with_timeout(self._reset_udp_manager())
+        
+        # Mock client config
+        self.client_config_map = MagicMock()
+        self.client_config_map.derivative_qtx_perpetual_exchange_backend = self.exchange_backend
+        # Fix throttler initialization by adding rate_limits_share_pct
+        self.client_config_map.rate_limits_share_pct = Decimal("100")
+        
+        # Create mock socket
+        self.mock_socket = MockUDPSocket()
+        
+        # Patch socket creation to use our mock
+        self.socket_patcher = patch('socket.socket', return_value=self.mock_socket)
+        self.socket_patcher.start()
+        
+        # Create the connector
+        self.connector = QtxPerpetualDerivative(
+            client_config_map=self.client_config_map,
+            qtx_perpetual_host=TEST_UDP_HOST,
+            qtx_perpetual_port=TEST_UDP_PORT,
+            exchange_backend=self.exchange_backend,
             trading_pairs=[self.trading_pair],
-            connector=MagicMock(),
-            api_factory=MagicMock(),
-            udp_manager_instance=self.udp_manager,
+            trading_required=False  # Disable trading to avoid API key requirements
         )
-        # api_logger = self.data_source.logger() # F841 local variable 'api_logger' is assigned to but never used (Removed)
-        self.data_source.logger().setLevel(1)
-
+        
     def tearDown(self):
+        # Stop socket patcher
+        if hasattr(self, 'socket_patcher'):
+            self.socket_patcher.stop()
+        
+        # Clean up any remaining tasks in the local event loop
+        for task in asyncio.all_tasks(self.local_event_loop):
+            if not task.done():
+                task.cancel()
         super().tearDown()
-
-    def async_run_with_timeout(self, coroutine, timeout: float = 30):
-        return self.loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
-
-    def _build_partial_fill_trade_update(
-        self, timestamp: float, trade_price: Decimal, amount: Decimal, order_id: str
-    ) -> dict:
-        """Build a simulated trade update for testing."""
-        return {
-            "timestamp": timestamp,
-            "price": float(trade_price),
-            "amount": float(amount),
-            "order_id": order_id,
-            "side": "buy",
-        }
-
-    async def test_get_new_order_book(self):
-        """Test get_new_order_book creates a new order book instance."""
-        order_book = await self.data_source.get_new_order_book(self.trading_pair)
-        self.assertIsInstance(order_book, OrderBook)
-
-    async def test_order_book_snapshot_message_from_exchange(self):
-        """Test that a proper order book snapshot message is created from exchange data."""
-        snapshot_data = {
-            "timestamp": 1234567890.123,
-            "symbol": "BTCUSDT",
-            "bids": [[45000.0, 1.5], [44900.0, 2.5]],
-            "asks": [[45100.0, 2.0], [45200.0, 3.0]],
-            "update_id": 1000,
-        }
-
-        message = self.data_source._order_book_snapshot_message_from_exchange(
-            snapshot_data, snapshot_data["timestamp"], metadata={"trading_pair": self.trading_pair}
-        )
-
-        self.assertIsInstance(message, OrderBookMessage)
-        self.assertEqual(message.trading_pair, self.trading_pair)
-        self.assertEqual(message.timestamp, snapshot_data["timestamp"])
-        self.assertEqual(len(message.bids), 2)
-        self.assertEqual(len(message.asks), 2)
-
-    async def test_order_book_diff_message_from_exchange(self):
-        """Test that a proper order book diff message is created from exchange data."""
-        diff_data = {
-            "timestamp": 1234567890.456,
-            "symbol": "BTCUSDT",
-            "bids": [[45000.0, 0.0], [44950.0, 3.5]],  # First entry removes a level
-            "asks": [[45100.0, 0.0], [45150.0, 1.5]],  # First entry removes a level
-            "update_id": 1001,
-        }
-
-        message = self.data_source._order_book_diff_message_from_exchange(
-            diff_data, diff_data["timestamp"], metadata={"trading_pair": self.trading_pair}
-        )
-
-        self.assertIsInstance(message, OrderBookMessage)
-        self.assertEqual(message.trading_pair, self.trading_pair)
-        self.assertEqual(message.timestamp, diff_data["timestamp"])
-        self.assertEqual(len(message.bids), 2)
-        self.assertEqual(len(message.asks), 2)
-        self.assertEqual(message.bids[0].amount, 0.0)  # Indicates removal
-        self.assertEqual(message.asks[0].amount, 0.0)  # Indicates removal
-
-    async def test_order_book_trade_message_from_exchange(self):
-        """Test that a proper trade message is created from exchange data."""
-        trade_data = {
-            "timestamp": 1234567890.789,
-            "symbol": "BTCUSDT",
-            "price": 45050.0,
-            "amount": 0.5,
-            "side": "buy",
-            "id": "12345",
-        }
-
-        message = self.data_source._order_book_trade_message_from_exchange(
-            trade_data, trade_data["timestamp"], metadata={"trading_pair": self.trading_pair}
-        )
-
-        self.assertIsInstance(message, OrderBookMessage)
-        self.assertEqual(message.trading_pair, self.trading_pair)
-        self.assertEqual(message.timestamp, trade_data["timestamp"])
-        self.assertEqual(float(message.content["price"]), trade_data["price"])
-        self.assertEqual(float(message.content["amount"]), trade_data["amount"])
-        self.assertEqual(message.content["trade_type"], "buy")
-        self.assertEqual(message.content["trade_id"], trade_data["id"])
-
-    async def test_listen_for_subscriptions(self):
-        """Test UDP subscription flow with mock socket."""
-        # Mock the socket and UDP functionality
-        mock_socket = MagicMock()
-
-        # Subscription ACK
-        ack_data = struct.pack("<I", 1)  # Subscribe ACK with index
-
-        # Depth data (type 2)
-        depth_header = struct.pack(
-            "<Idcccc",
-            1,  # index
-            1234567890.123,  # timestamp
-            b"2",  # message type (depth)
-            b"1",  # sub_type (snapshot)
-            b"1",  # index (again)
-            b"2",
-        )  # reserve
-
-        bids = [(45000.0, 1.5), (44900.0, 2.5)]
-        asks = [(45100.0, 2.0), (45200.0, 3.0)]
-
-        num_bid_levels = struct.pack("<H", len(bids))
-        num_ask_levels = struct.pack("<H", len(asks))
-
-        bid_data = b""
-        for price, size in bids:
-            bid_data += struct.pack("<dd", price, size)
-
-        ask_data = b""
-        for price, size in asks:
-            ask_data += struct.pack("<dd", price, size)
-
-        depth_data = depth_header + num_bid_levels + num_ask_levels + bid_data + ask_data
-
-        # Mock socket behavior
-        mock_socket.recv.side_effect = [ack_data, depth_data, asyncio.CancelledError]
-
-        with patch.object(self.udp_manager, "socket", mock_socket):
-            with patch.object(self.udp_manager, "_is_connected", True):
-                # Set up subscription
-                self.data_source._trading_pairs = [self.trading_pair]
-                self.udp_manager._add_subscription(self.qtx_trading_pair, self.data_source._handle_depth_message)
-
-                # Run the listener
-                try:
-                    await self.data_source.listen_for_subscriptions()
-                except asyncio.CancelledError:
-                    pass
-
-        # Assertions would go here based on your callback actions
-        # Since we can't directly verify the callback, we test the UDP manager's behavior
-        self.assertTrue(mock_socket.recv.called)
-
-    async def test_websocket_connection_failure(self):
-        """Test handling of websocket connection failure."""
-        with patch.object(self.data_source, "_create_websocket_connection") as mock_create_conn:
-            mock_create_conn.side_effect = Exception("Connection failed")
-
-            # Order book stream should handle the error gracefully
-            order_book_stream_queue = asyncio.Queue()
-
-            async def collect_messages(queue):
-                messages = []
-                try:
-                    while True:
-                        message = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        messages.append(message)
-                except asyncio.TimeoutError:
-                    pass
-                return messages
-
-            # Start listening for order book stream
-            listen_task = self.loop.create_task(
-                self.data_source.listen_for_order_book_stream(ev_loop=self.loop, output=order_book_stream_queue)
+        
+    def test_dynamic_inheritance_structure(self):
+        """Test that the connector properly inherits from parent exchange and has required methods"""
+        # Verify inheritance
+        exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+        module = importlib.import_module(exchange_info["module"])
+        parent_class = getattr(module, exchange_info["class"])
+        
+        self.assertIsInstance(self.connector, parent_class)
+        self.assertEqual(self.connector.name, "qtx_perpetual")
+        
+        # Verify QTX-specific methods exist
+        self.assertTrue(hasattr(self.connector, "_setup_qtx_market_data"))
+        self.assertTrue(hasattr(self.connector, "_setup_qtx_udp_subscriptions"))
+        self.assertTrue(hasattr(self.connector, "_consume_diff_messages"))
+        self.assertTrue(hasattr(self.connector, "_consume_trade_messages"))
+        self.assertTrue(hasattr(self.connector, "_handle_orderbook_snapshots"))
+        self.assertTrue(hasattr(self.connector, "_build_qtx_orderbook_snapshot"))
+        
+    def test_order_book_tracker_initialization(self):
+        """Test that order book tracker is properly initialized with QTX data source"""
+        # Access order book tracker
+        tracker = self.connector.order_book_tracker
+        self.assertIsNotNone(tracker)
+        self.assertIsInstance(tracker, OrderBookTracker)
+        
+        # Verify data source is initialized
+        data_source = tracker.data_source
+        self.assertIsNotNone(data_source)
+        self.assertIsInstance(data_source, OrderBookTrackerDataSource)
+        
+        # Verify trading pairs
+        self.assertEqual(tracker._trading_pairs, [self.trading_pair])
+        
+    async def test_udp_subscription_flow(self):
+        """Test the complete UDP subscription flow"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Prepare subscription response
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+            self.mock_socket.receive_buffer.append((f"1:{qtx_symbol}".encode(), (TEST_UDP_HOST, TEST_UDP_PORT)))
+            
+            # Initialize UDP manager
+            await self.connector._init_udp_manager()
+            udp_manager = self.connector.udp_manager
+            
+            # Start UDP connection
+            await udp_manager.start()
+            
+            # Subscribe to trading pairs
+            await self.connector._setup_qtx_udp_subscriptions()
+            
+            # Verify subscription was sent
+            self.assertEqual(len(self.mock_socket.sent_data), 2)  # ping + subscription
+            sent_symbol = self.mock_socket.sent_data[1][0].decode()
+            self.assertEqual(sent_symbol, qtx_symbol)
+            
+            # Verify queues were created
+            self.assertIn(self.trading_pair, self.connector._udp_queues)
+            queues = self.connector._udp_queues[self.trading_pair]
+            self.assertIn("diff", queues)
+            self.assertIn("trade", queues)
+            
+    async def test_order_book_diff_message_flow(self):
+        """Test that order book diff messages flow from UDP to order book"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Setup subscription
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+            self.mock_socket.receive_buffer.append((f"1:{qtx_symbol}".encode(), (TEST_UDP_HOST, TEST_UDP_PORT)))
+            
+            # Initialize and subscribe
+            await self.connector._init_udp_manager()
+            await self.connector.udp_manager.start()
+            await self.connector._setup_qtx_udp_subscriptions()
+            
+            # Create a depth message
+            timestamp_ns = int(time.time() * 1e9)
+            update_id = 12345
+            header = struct.pack("<iiqqqq", 2, 1, update_id, timestamp_ns, 0, 0)  # type=2 (depth), index=1
+            asks_bids_count = struct.pack("<qq", 2, 2)  # 2 asks, 2 bids
+            asks = struct.pack("<dd", 45100.0, 1.5) + struct.pack("<dd", 45200.0, 2.0)
+            bids = struct.pack("<dd", 45000.0, 1.0) + struct.pack("<dd", 44900.0, 2.5)
+            depth_message = header + asks_bids_count + asks + bids
+            
+            # Process the message
+            await self.connector.udp_manager._process_message(depth_message)
+            
+            # Verify message was added to diff queue
+            diff_queue = self.connector._udp_queues[self.trading_pair]["diff"]
+            self.assertEqual(diff_queue.qsize(), 1)
+            
+            # Get the message
+            message = await diff_queue.get()
+            self.assertIsInstance(message, OrderBookMessage)
+            self.assertEqual(message.type, OrderBookMessageType.DIFF)
+            self.assertEqual(message.content["trading_pair"], self.trading_pair)
+            self.assertEqual(message.content["update_id"], update_id)
+            self.assertEqual(len(message.content["bids"]), 2)
+            self.assertEqual(len(message.content["asks"]), 2)
+            
+    async def test_trade_message_flow(self):
+        """Test that trade messages flow from UDP to trade queue"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Setup subscription
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+            self.mock_socket.receive_buffer.append((f"1:{qtx_symbol}".encode(), (TEST_UDP_HOST, TEST_UDP_PORT)))
+            
+            # Initialize and subscribe
+            await self.connector._init_udp_manager()
+            await self.connector.udp_manager.start()
+            await self.connector._setup_qtx_udp_subscriptions()
+            
+            # Create a trade message
+            timestamp_ns = int(time.time() * 1e9)
+            update_id = 67890
+            header = struct.pack("<iiqqqq", 3, 1, update_id, timestamp_ns, 0, 0)  # type=3 (trade buy), index=1
+            trade_data = struct.pack("<dd", 45050.0, 0.5)  # price, amount
+            trade_message = header + trade_data
+            
+            # Process the message
+            await self.connector.udp_manager._process_message(trade_message)
+            
+            # Verify message was added to trade queue
+            trade_queue = self.connector._udp_queues[self.trading_pair]["trade"]
+            self.assertEqual(trade_queue.qsize(), 1)
+            
+            # Get the message
+            message = await trade_queue.get()
+            self.assertIsInstance(message, OrderBookMessage)
+            self.assertEqual(message.type, OrderBookMessageType.TRADE)
+            self.assertEqual(message.content["trading_pair"], self.trading_pair)
+            self.assertEqual(message.content["trade_type"], float(TradeType.BUY.value))
+            self.assertEqual(message.content["price"], "45050.0")
+            self.assertEqual(message.content["amount"], "0.5")
+            
+    async def test_order_book_snapshot_building(self):
+        """Test building order book snapshot from collected messages"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Setup subscription
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+            self.mock_socket.receive_buffer.append((f"1:{qtx_symbol}".encode(), (TEST_UDP_HOST, TEST_UDP_PORT)))
+            
+            # Initialize and subscribe
+            await self.connector._init_udp_manager()
+            await self.connector.udp_manager.start()
+            await self.connector._setup_qtx_udp_subscriptions()
+            
+            # Mock the UDP manager's build_orderbook_snapshot method
+            snapshot_data = {
+                "trading_pair": self.trading_pair,
+                "update_id": 12345,
+                "bids": [[45000.0, 1.5], [44900.0, 2.5]],
+                "asks": [[45100.0, 2.0], [45200.0, 3.0]],
+                "timestamp": time.time()
+            }
+            
+            with patch.object(self.connector.udp_manager, 'build_orderbook_snapshot', 
+                            return_value=snapshot_data) as mock_build:
+                # Call the snapshot builder
+                snapshot = await self.connector._build_qtx_orderbook_snapshot(self.trading_pair)
+                
+                # Verify snapshot format
+                self.assertIsInstance(snapshot, OrderBookMessage)
+                self.assertEqual(snapshot.type, OrderBookMessageType.SNAPSHOT)
+                self.assertEqual(snapshot.content["trading_pair"], self.trading_pair)
+                self.assertEqual(snapshot.content["update_id"], 12345)
+                self.assertEqual(len(snapshot.content["bids"]), 2)
+                self.assertEqual(len(snapshot.content["asks"]), 2)
+                
+                # Verify build_orderbook_snapshot was called
+                mock_build.assert_called_once_with(self.trading_pair)
+                
+    async def test_message_consumption_from_queues(self):
+        """Test that messages are properly consumed from queues"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Setup subscription
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+            self.mock_socket.receive_buffer.append((f"1:{qtx_symbol}".encode(), (TEST_UDP_HOST, TEST_UDP_PORT)))
+            
+            # Initialize and subscribe
+            await self.connector._init_udp_manager()
+            await self.connector.udp_manager.start()
+            await self.connector._setup_qtx_udp_subscriptions()
+            
+            # Create test messages
+            diff_message = OrderBookMessage(
+                message_type=OrderBookMessageType.DIFF,
+                content={
+                    "trading_pair": self.trading_pair,
+                    "update_id": 12345,
+                    "bids": [[45000.0, 1.5]],
+                    "asks": [[45100.0, 2.0]],
+                },
+                timestamp=time.time()
             )
-
-            # Collect any messages (should be empty due to connection failure)
-            messages = await collect_messages(order_book_stream_queue)
-
-            # Stop listening
-            listen_task.cancel()
-            try:
-                await listen_task
-            except asyncio.CancelledError:
-                pass
-
-            self.assertEqual(len(messages), 0)
-
-    @patch(
-        "hummingbot.connector.derivative.qtx_perpetual.qtx_perpetual_api_order_book_data_source.QtxPerpetualAPIOrderBookDataSource._time"
-    )
-    async def test_listen_for_trades_logs_exception(self, mock_time):
-        """Test that exceptions in trade listening are logged properly."""
-        mock_time.return_value = 1234567890.0
-        # incomplete_resp = {"trading_pair": self.trading_pair, "trade_type": "buy"} # F841 (Removed)
-
-        # Mock the queue to raise an exception
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = asyncio.CancelledError
-
-        # Test handling of exception
-        with self.assertRaises(asyncio.CancelledError):
-            await self.data_source.listen_for_trades(ev_loop=self.loop, output=mock_queue)
-
-    async def test_time_synchronizer_start_failure(self):
-        """Test handling of time synchronizer start failure."""
-        # Mock time synchronizer to raise an exception
-        with patch.object(self.data_source._time_synchronizer, "start", side_effect=Exception("Start failed")):
-            # This should handle the exception gracefully
-            # The exact behavior depends on implementation
-            pass
-
-    async def test_market_data_initialization(self):
-        """Test market data initialization process."""
-        # Mock required components
-        self.data_source._connector.trading_pair_symbol_map = {self.trading_pair: "BTCUSDT"}
-
-        with patch.object(self.udp_manager, "subscribe") as mock_subscribe:
-            with patch.object(self.udp_manager, "start") as mock_start:
-                # Test initialization
-                await self.data_source._init_market_data_feeds()
-
-                mock_start.assert_called_once()
-                mock_subscribe.assert_called_once_with(
-                    self.qtx_trading_pair, self.data_source._handle_depth_message
+            
+            trade_message = OrderBookMessage(
+                message_type=OrderBookMessageType.TRADE,
+                content={
+                    "trading_pair": self.trading_pair,
+                    "trade_type": float(TradeType.BUY.value),
+                    "price": "45050.0",
+                    "amount": "0.5",
+                },
+                timestamp=time.time()
+            )
+            
+            # Add messages to queues
+            diff_queue = self.connector._udp_queues[self.trading_pair]["diff"]
+            trade_queue = self.connector._udp_queues[self.trading_pair]["trade"]
+            
+            await diff_queue.put(diff_message)
+            await trade_queue.put(trade_message)
+            
+            # Test diff consumption
+            output_queue = asyncio.Queue()
+            consume_task = asyncio.create_task(
+                self.connector._consume_messages_from_queue(
+                    self.trading_pair, diff_queue, output_queue, "diff"
                 )
-
-    async def test_parsing_depth_update_from_udp_data(self):
-        """Test parsing depth update from UDP data."""
-        # Create header
-        header = struct.pack(
-            "<Idcccc",
-            1,  # index
-            1234567890.123,  # timestamp
-            b"2",  # message type (depth)
-            b"1",  # sub_type
-            b"1",  # index
-            b"2",  # reserve
-        )
-
-        # Create depth data (bids/asks)
-        bids = [(45000.0, 1.5), (44900.0, 2.5)]
-        asks = [(45100.0, 2.0), (45200.0, 3.0)]
-
-        num_bid_levels = struct.pack("<H", len(bids))
-        num_ask_levels = struct.pack("<H", len(asks))
-
-        bid_data = b""
-        for price, size in bids:
-            bid_data += struct.pack("<dd", price, size)
-
-        ask_data = b""
-        for price, size in asks:
-            ask_data += struct.pack("<dd", price, size)
-
-        payload = num_bid_levels + num_ask_levels + bid_data + ask_data
-        data = header + payload
-
-        # Create the callback mock
-        callback = MagicMock()
-
-        # Parse the data
-        self.udp_manager._parse_message(data, callback)
-
-        # Verify the callback was called with the correct parsed data
-        callback.assert_called_once()
-        message_data = callback.call_args[0][0]
-
-        self.assertEqual(message_data["type"], "depth")
-        self.assertEqual(message_data["sub_type"], 1)
-        self.assertEqual(message_data["symbol_index"], 1)
-        self.assertAlmostEqual(message_data["timestamp"], 1234567890.123)
-        self.assertEqual(len(message_data["bids"]), 2)
-        self.assertEqual(len(message_data["asks"]), 2)
-
-        # Verify bid/ask data
-        self.assertEqual(message_data["bids"][0], [45000.0, 1.5])
-        self.assertEqual(message_data["bids"][1], [44900.0, 2.5])
-        self.assertEqual(message_data["asks"][0], [45100.0, 2.0])
-        self.assertEqual(message_data["asks"][1], [45200.0, 3.0])
-
-    async def test_parsing_ticker_update_from_udp_data(self):
-        """Test parsing ticker update from UDP data."""
-        # Create header
-        header = struct.pack(
-            "<Idcccc",
-            1,  # index
-            1234567890.123,  # timestamp
-            b"1",  # message type (ticker)
-            b"1",  # sub_type
-            b"1",  # index
-            b"2",  # reserve
-        )
-
-        # Create ticker data
-        payload = struct.pack("<dd", 45050.0, 100.5)  # price, volume
-        data = header + payload
-
-        # Create the callback mock
-        callback = MagicMock()
-
-        # Parse the data
-        self.udp_manager._parse_message(data, callback)
-
-        # Verify the callback was called with the correct parsed data
-        callback.assert_called_once()
-        message_data = callback.call_args[0][0]
-
-        self.assertEqual(message_data["type"], "ticker")
-        self.assertEqual(message_data["sub_type"], 1)
-        self.assertEqual(message_data["symbol_index"], 1)
-        self.assertAlmostEqual(message_data["timestamp"], 1234567890.123)
-        self.assertAlmostEqual(message_data["price"], 45050.0)
-        self.assertAlmostEqual(message_data["volume"], 100.5)
-
-    async def test_parsing_trade_update_from_udp_data(self):
-        """Test parsing trade update from UDP data."""
-        # Create header
-        header = struct.pack(
-            "<Idcccc",
-            1,  # index
-            1234567890.123,  # timestamp
-            b"3",  # message type (trade)
-            b"1",  # sub_type (buy)
-            b"1",  # index
-            b"2",  # reserve
-        )
-
-        # Create trade data
-        payload = struct.pack("<dd", 45050.0, 0.5)  # price, amount
-        data = header + payload
-
-        # Create the callback mock
-        callback = MagicMock()
-
-        # Parse the data
-        self.udp_manager._parse_message(data, callback)
-
-        # Verify the callback was called with the correct parsed data
-        callback.assert_called_once()
-        message_data = callback.call_args[0][0]
-
-        self.assertEqual(message_data["type"], "trade")
-        self.assertEqual(message_data["sub_type"], 1)
-        self.assertEqual(message_data["symbol_index"], 1)
-        self.assertAlmostEqual(message_data["timestamp"], 1234567890.123)
-        self.assertAlmostEqual(message_data["price"], 45050.0)
-        self.assertAlmostEqual(message_data["amount"], 0.5)
-        self.assertEqual(message_data["side"], "buy")
-
-    async def test_symbol_subscription_mapping(self):
-        """Test that symbol subscription is properly mapped."""
-        # Mock UDP manager
-        with patch.object(self.udp_manager, "subscribe") as mock_subscribe:
-            # Subscribe to a trading pair
-            await self.udp_manager.start()
-            self.udp_manager.subscribe("binance-futures:btcusdt", self.data_source._handle_depth_message)
-
-            # Verify the subscribe was called with correct parameters
-            mock_subscribe.assert_called_with("binance-futures:btcusdt", self.data_source._handle_depth_message)
-
-    async def test_ticker_update_handling(self):
-        """Test handling of ticker updates from UDP feed."""
-        ticker_data = {
-            "type": "ticker",
-            "sub_type": 1,
-            "symbol_index": 1,
-            "timestamp": time.time(),
-            "price": 45050.0,
-            "volume": 100.5,
-        }
-
-        with patch.object(self.data_source, "_emit_order_book_event") as mock_emit:
-            # Handle ticker update
-            await self.data_source._handle_ticker_message(ticker_data)
-
-            # Ticker update typically doesn't emit order book event
-            mock_emit.assert_not_called()
-
-    async def test_depth_update_handling(self):
-        """Test handling of depth updates from UDP feed."""
-        depth_data = {
-            "type": "depth",
-            "sub_type": 1,  # snapshot
-            "symbol_index": 1,
-            "timestamp": time.time(),
-            "bids": [[45000.0, 1.5], [44900.0, 2.5]],
-            "asks": [[45100.0, 2.0], [45200.0, 3.0]],
-        }
-
-        with patch.object(self.data_source, "_emit_order_book_event") as mock_emit:
-            # Set up the symbol mapping
-            self.udp_manager._index_to_symbol[1] = self.qtx_trading_pair
-            self.data_source._trading_pairs = [self.trading_pair]
-
-            # Handle depth update
-            await self.data_source._handle_depth_message(depth_data)
-
-            # Should emit an order book event
-            mock_emit.assert_called_once()
-
-    async def test_trade_update_handling(self):
-        """Test handling of trade updates from UDP feed."""
-        trade_data = {
-            "type": "trade",
-            "sub_type": 1,  # buy
-            "symbol_index": 1,
-            "timestamp": time.time(),
-            "price": 45050.0,
-            "amount": 0.5,
-            "side": "buy",
-        }
-
-        with patch.object(self.data_source, "_emit_trade_event") as mock_emit:
-            # Set up the symbol mapping
-            self.udp_manager._index_to_symbol[1] = self.qtx_trading_pair
-            self.data_source._trading_pairs = [self.trading_pair]
-
-            # Handle trade update
-            await self.data_source._handle_trade_message(trade_data)
-
-            # Should emit a trade event
-            mock_emit.assert_called_once()
-
-    async def test_emit_order_book_event(self):
-        """Test emission of order book events to queue."""
-        event_queue = asyncio.Queue()
-        self.data_source._message_queue[self.data_source._order_book_stream_event_listener_task] = event_queue
-
-        depth_data = {
-            "type": "depth",
-            "sub_type": 1,  # snapshot
-            "symbol_index": 1,
-            "timestamp": time.time(),
-            "bids": [[45000.0, 1.5], [44900.0, 2.5]],
-            "asks": [[45100.0, 2.0], [45200.0, 3.0]],
-        }
-
-        # Emit the event
-        await self.data_source._emit_order_book_event(depth_data)
-
-        # Verify the event was added to the queue
-        self.assertEqual(event_queue.qsize(), 1)
-        event = await event_queue.get()
-        self.assertEqual(event["type"], "depth")
-
-    async def test_emit_trade_event(self):
-        """Test emission of trade events to queue."""
-        event_queue = asyncio.Queue()
-        self.data_source._message_queue[self.data_source._trade_listener_task] = event_queue
-
-        trade_data = {
-            "type": "trade",
-            "sub_type": 1,  # buy
-            "symbol_index": 1,
-            "timestamp": time.time(),
-            "price": 45050.0,
-            "amount": 0.5,
-            "side": "buy",
-        }
-
-        # Emit the event
-        await self.data_source._emit_trade_event(trade_data)
-
-        # Verify the event was added to the queue
-        self.assertEqual(event_queue.qsize(), 1)
-        event = await event_queue.get()
-        self.assertEqual(event["type"], "trade")
-
-    async def test_funding_info_update_stream(self):
-        """Test funding info update stream functionality."""
-        event_queue = asyncio.Queue()
-
-        # Mock funding info
-        funding_info = FundingInfo(
-            trading_pair=self.trading_pair,
-            index_price=45000.0,
-            mark_price=45050.0,
-            next_funding_utc_timestamp=1234567890,
-            rate=0.0001,
-        )
-
-        # Add funding info to queue
-        await event_queue.put(funding_info)
-
-        self.data_source._message_queue[self.data_source._funding_info_listener_task] = event_queue
-
-        # Listen for funding info updates
-        output_queue = asyncio.Queue()
-
-        async def collect_funding_info():
-            async for info in self.data_source.listen_for_funding_info(output_queue):
-                return info
-
-        # The queue has one item, so we should get one funding info
-        info = await collect_funding_info()
-        self.assertEqual(info.trading_pair, self.trading_pair)
-        self.assertEqual(info.rate, Decimal("0.0001"))
-
-    async def test_message_queue_error_handling(self):
-        """Test error handling in message queue processing."""
-        event_queue = asyncio.Queue()
-        self.data_source._message_queue[self.data_source._order_book_stream_event_listener_task] = event_queue
-
-        # Add an invalid message that will cause an exception
-        invalid_message = {"invalid": "data"}
-        await event_queue.put(invalid_message)
-
-        # Create output queue
-        output_queue = asyncio.Queue()
-
-        # Try to process the message (should handle the error gracefully)
-        with patch.object(self.data_source, "logger") as mock_logger:
-            # Run the listener briefly
-            listen_task = self.loop.create_task(
-                self.data_source.listen_for_order_book_stream(ev_loop=self.loop, output=output_queue)
             )
-
-            # Wait briefly for message processing
+            
+            # Wait briefly for consumption
             await asyncio.sleep(0.1)
-
-            # Stop the listener
-            listen_task.cancel()
+            
+            # Cancel the task
+            consume_task.cancel()
             try:
-                await listen_task
+                await consume_task
             except asyncio.CancelledError:
                 pass
-
-            # Error should have been logged
-            self.assertTrue(mock_logger.error.called or mock_logger.network.called)
-
-    async def test_malformed_udp_data_handling(self):
-        """Test handling of malformed UDP data."""
-        # Create malformed data (too short)
-        malformed_data = b"short"
-
-        callback = MagicMock()
-
-        # This should handle the error gracefully
-        with patch.object(self.udp_manager, "logger") as mock_logger:
-            self.udp_manager._parse_message(malformed_data, callback)
-
-            # Should log an error
-            mock_logger.error.assert_called()
-            # Callback should not be called
-            callback.assert_not_called()
-
-    async def test_listen_for_funding_info(self):
-        """Test listening for funding info updates."""
-        event_queue = asyncio.Queue()
-
-        # Create a funding info update
-        funding_update = FundingInfo(
-            trading_pair=self.trading_pair,
-            index_price=45000.0,
-            mark_price=45050.0,
-            next_funding_utc_timestamp=1234567890,
-            rate=0.0001,
-        )
-
-        # Add to event queue
-        await event_queue.put(funding_update)
-
-        # Set up the message queue
-        self.data_source._message_queue[self.data_source._funding_info_listener_task] = event_queue
-
-        # Create output queue
+            
+            # Verify message was forwarded
+            self.assertEqual(output_queue.qsize(), 1)
+            forwarded_message = await output_queue.get()
+            self.assertEqual(forwarded_message, diff_message)
+            
+    async def test_data_source_listener_methods(self):
+        """Test that the overridden data source listener methods work correctly"""
+        # Get the data source
+        data_source = self.connector.order_book_tracker.data_source
+        
+        # Test listen_for_subscriptions override
+        with patch.object(self.connector, '_setup_qtx_udp_subscriptions', new_callable=AsyncMock) as mock_setup:
+            await data_source.listen_for_subscriptions()
+            mock_setup.assert_called_once()
+            
+        # Test listen_for_order_book_diffs override
         output_queue = asyncio.Queue()
+        with patch.object(self.connector, '_consume_diff_messages', new_callable=AsyncMock) as mock_consume:
+            await data_source.listen_for_order_book_diffs(self.local_event_loop, output_queue)
+            mock_consume.assert_called_once_with(output_queue)
+            
+        # Test listen_for_order_book_snapshots override
+        with patch.object(self.connector, '_handle_orderbook_snapshots', new_callable=AsyncMock) as mock_handle:
+            await data_source.listen_for_order_book_snapshots(self.local_event_loop, output_queue)
+            mock_handle.assert_called_once_with(output_queue)
+            
+        # Test listen_for_trades override
+        with patch.object(self.connector, '_consume_trade_messages', new_callable=AsyncMock) as mock_consume:
+            await data_source.listen_for_trades(self.local_event_loop, output_queue)
+            mock_consume.assert_called_once_with(output_queue)
+            
+        # Test _order_book_snapshot override
+        expected_snapshot = OrderBookMessage(
+            message_type=OrderBookMessageType.SNAPSHOT,
+            content={"trading_pair": self.trading_pair},
+            timestamp=time.time()
+        )
+        
+        with patch.object(self.connector, '_build_qtx_orderbook_snapshot', 
+                         return_value=expected_snapshot) as mock_build:
+            result = await data_source._order_book_snapshot(self.trading_pair)
+            mock_build.assert_called_once_with(self.trading_pair)
+            self.assertEqual(result, expected_snapshot)
+            
+    async def test_network_lifecycle(self):
+        """Test the network start/stop lifecycle"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Mock the parent's start_network method
+            with patch.object(self.connector.__class__.__bases__[0], 'start_network', 
+                            new_callable=AsyncMock) as mock_parent_start:
+                # Start network
+                await self.connector.start_network()
+                
+                # Verify parent start_network was called
+                mock_parent_start.assert_called_once()
+                
+                # Verify UDP manager is initialized
+                self.assertIsNotNone(self.connector._udp_manager)
+                
+            # Stop network
+            with patch.object(self.connector.__class__.__bases__[0], 'stop_network', 
+                            new_callable=AsyncMock) as mock_parent_stop:
+                await self.connector.stop_network()
+                
+                # Verify parent stop_network was called
+                mock_parent_stop.assert_called_once()
+                
+                # Verify UDP socket was closed
+                self.assertTrue(self.mock_socket.closed)
+                
+    async def test_error_handling_in_message_processing(self):
+        """Test error handling when processing messages"""
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Setup subscription
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+            self.mock_socket.receive_buffer.append((f"1:{qtx_symbol}".encode(), (TEST_UDP_HOST, TEST_UDP_PORT)))
+            
+            # Initialize and subscribe
+            await self.connector._init_udp_manager()
+            await self.connector.udp_manager.start()
+            await self.connector._setup_qtx_udp_subscriptions()
+            
+            # Test handling of malformed message
+            malformed_message = b"invalid_data"
+            
+            # Should not raise exception
+            await self.connector.udp_manager._process_message(malformed_message)
+            
+            # Verify no messages were added to queues
+            diff_queue = self.connector._udp_queues[self.trading_pair]["diff"]
+            trade_queue = self.connector._udp_queues[self.trading_pair]["trade"]
+            self.assertEqual(diff_queue.qsize(), 0)
+            self.assertEqual(trade_queue.qsize(), 0)
+            
+    async def test_multiple_trading_pairs(self):
+        """Test handling multiple trading pairs"""
+        # Create connector with multiple pairs
+        trading_pairs = ["BTC-USDT", "ETH-USDT"]
+        connector = QtxPerpetualDerivative(
+            client_config_map=self.client_config_map,
+            qtx_perpetual_host=TEST_UDP_HOST,
+            qtx_perpetual_port=TEST_UDP_PORT,
+            exchange_backend=self.exchange_backend,
+            trading_pairs=trading_pairs,
+            trading_required=False
+        )
+        
+        with patch('socket.socket') as mock_socket_class:
+            mock_socket_class.return_value = self.mock_socket
+            
+            # Prepare subscription responses
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[self.exchange_backend.lower()]
+            for i, pair in enumerate(trading_pairs):
+                qtx_symbol = f"{exchange_info['exchange_name_on_qtx']}:{pair.lower().replace('-', '')}"
+                self.mock_socket.receive_buffer.append((f"{i+1}:{qtx_symbol}".encode(), ("127.0.0.1", 8080)))
+            
+            # Initialize and subscribe
+            await connector._init_udp_manager()
+            await connector.udp_manager.start()
+            await connector._setup_qtx_udp_subscriptions()
+            
+            # Verify queues were created for all pairs
+            for pair in trading_pairs:
+                self.assertIn(pair, connector._udp_queues)
+                queues = connector._udp_queues[pair]
+                self.assertIn("diff", queues)
+                self.assertIn("trade", queues)
 
-        # Start listening
-        listen_task = self.loop.create_task(self.data_source.listen_for_funding_info(output_queue))
 
-        # Collect the funding info
-        try:
-            funding_info = await asyncio.wait_for(output_queue.get(), timeout=1.0)
-            self.assertEqual(funding_info.trading_pair, funding_update.trading_pair)
-            self.assertEqual(funding_info.rate, funding_update.rate)
-            self.assertEqual(funding_info.next_funding_utc_timestamp, funding_update.next_funding_utc_timestamp)
-        finally:
-            listen_task.cancel()
-            try:
-                await listen_task
-            except asyncio.CancelledError:
-                pass
-
-    async def test_order_book_integrity(self):
-        """Test order book update ID sequencing and integrity."""
-        # Create a new order book
-        order_book = OrderBook()
-
-        # Create snapshot data
-        snapshot_timestamp = time.time()  # noqa: F841
-        snapshot_update_id = 1000
-        snapshot_bids = [[45000.0, 1.5], [44900.0, 2.5]]
-        snapshot_asks = [[45100.0, 2.0], [45200.0, 3.0]]
-
-        # Convert to OrderBookRow objects
-        snapshot_bid_rows = [
-            OrderBookRow(price=float(bid[0]), amount=float(bid[1]), update_id=snapshot_update_id)
-            for bid in snapshot_bids
-        ]
-        snapshot_ask_rows = [
-            OrderBookRow(price=float(ask[0]), amount=float(ask[1]), update_id=snapshot_update_id)
-            for ask in snapshot_asks
-        ]
-
-        # Apply snapshot
-        order_book.apply_snapshot(snapshot_bid_rows, snapshot_ask_rows, snapshot_update_id)
-
-        # Verify snapshot was applied
-        self.assertEqual(snapshot_update_id, order_book.snapshot_uid)
-        actual_bids = list(order_book.bid_entries())
-        actual_asks = list(order_book.ask_entries())
-        self.assertEqual(2, len(actual_bids))
-        self.assertEqual(2, len(actual_asks))
-
-        # Test 1: Stale update (should be ignored)
-        old_diff_update_id = 500  # Lower than snapshot's update_id
-        old_diff_bids = [[44800.0, 3.0]]
-        old_diff_asks = [[45300.0, 1.0]]
-
-        old_diff_bid_rows = [
-            OrderBookRow(price=float(bid[0]), amount=float(bid[1]), update_id=old_diff_update_id)
-            for bid in old_diff_bids
-        ]
-        old_diff_ask_rows = [
-            OrderBookRow(price=float(ask[0]), amount=float(ask[1]), update_id=old_diff_update_id)
-            for ask in old_diff_asks
-        ]
-
-        # Apply stale diff
-        order_book.apply_diffs(old_diff_bid_rows, old_diff_ask_rows, old_diff_update_id)
-
-        # Verify snapshot_uid hasn't changed
-        self.assertEqual(snapshot_update_id, order_book.snapshot_uid)
-
-        # Get current bid/ask entries (unused but defined for consistency)
-        stale_update_bids = list(order_book.bid_entries())  # noqa: F841
-        stale_update_asks = list(order_book.ask_entries())  # noqa: F841
-
-        # Test 2: Valid sequential update
-        valid_diff_update_id = 1001  # Exactly snapshot_update_id + 1
-        valid_diff_bids = [[44950.0, 1.0]]  # Add a new price level
-        valid_diff_asks = [[45150.0, 1.5]]  # Add a new price level
-
-        # Create a fresh order book for this test to avoid side effects
-        order_book_2 = OrderBook()
-        order_book_2.apply_snapshot(snapshot_bid_rows, snapshot_ask_rows, snapshot_update_id)
-
-        valid_diff_bid_rows = [
-            OrderBookRow(price=float(bid[0]), amount=float(bid[1]), update_id=valid_diff_update_id)
-            for bid in valid_diff_bids
-        ]
-        valid_diff_ask_rows = [
-            OrderBookRow(price=float(ask[0]), amount=float(ask[1]), update_id=valid_diff_update_id)
-            for ask in valid_diff_asks
-        ]
-
-        # Apply valid diff
-        order_book_2.apply_diffs(valid_diff_bid_rows, valid_diff_ask_rows, valid_diff_update_id)
-
-        # Verify last_diff_uid has changed
-        self.assertEqual(valid_diff_update_id, order_book_2.last_diff_uid)
-
-        # Get updated bid/ask entries
-        updated_bids = list(order_book_2.bid_entries())
-        updated_asks = list(order_book_2.ask_entries())
-        self.assertEqual(3, len(updated_bids))
-        self.assertEqual(3, len(updated_asks))
-
-        # Test 3: Update with a gap
-        gap_diff_update_id = 1005  # Gap between 1001 and 1005
-        gap_diff_bids = [[44800.0, 3.0]]
-        gap_diff_asks = [[45300.0, 1.0]]
-
-        # Create a fresh order book for this test to avoid side effects
-        order_book_3 = OrderBook()
-        order_book_3.apply_snapshot(snapshot_bid_rows, snapshot_ask_rows, snapshot_update_id)
-
-        gap_diff_bid_rows = [
-            OrderBookRow(price=float(bid[0]), amount=float(bid[1]), update_id=gap_diff_update_id)
-            for bid in gap_diff_bids
-        ]
-        gap_diff_ask_rows = [
-            OrderBookRow(price=float(ask[0]), amount=float(ask[1]), update_id=gap_diff_update_id)
-            for ask in gap_diff_asks
-        ]
-
-        # Apply gap diff
-        order_book_3.apply_diffs(gap_diff_bid_rows, gap_diff_ask_rows, gap_diff_update_id)
-
-        # Verify last_diff_uid has changed to the gap update
-        self.assertEqual(gap_diff_update_id, order_book_3.last_diff_uid)
-
-        # Check all bids and asks
-        final_bids = list(order_book_3.bid_entries())
-        final_asks = list(order_book_3.ask_entries())
-
-        # Order book 3 should have original 2 entries plus 1 new one
-        self.assertEqual(3, len(final_bids))
-        self.assertEqual(3, len(final_asks))
+class TestQtxOrderBookIntegrationWithDifferentExchanges(IsolatedAsyncioWrapperTestCase):
+    """Test QTX order book integration with different parent exchanges"""
+    
+    # Mapping of exchange names to their order book data source modules/classes
+    EXCHANGE_ORDER_BOOK_DATA_SOURCES = {
+        "binance": {
+            "module": "hummingbot.connector.derivative.binance_perpetual.binance_perpetual_api_order_book_data_source",
+            "class": "BinancePerpetualAPIOrderBookDataSource"
+        },
+        "okx": {
+            "module": "hummingbot.connector.derivative.okx_perpetual.okx_perpetual_api_order_book_data_source",
+            "class": "OkxPerpetualAPIOrderBookDataSource"
+        },
+        "bitget": {
+            "module": "hummingbot.connector.derivative.bitget_perpetual.bitget_perpetual_api_order_book_data_source",
+            "class": "BitgetPerpetualAPIOrderBookDataSource"
+        },
+        "bybit": {
+            "module": "hummingbot.connector.derivative.bybit_perpetual.bybit_perpetual_api_order_book_data_source",
+            "class": "BybitPerpetualAPIOrderBookDataSource"
+        },
+        "kucoin": {
+            "module": "hummingbot.connector.derivative.kucoin_perpetual.kucoin_perpetual_api_order_book_data_source",
+            "class": "KucoinPerpetualAPIOrderBookDataSource"
+        },
+        "gate_io": {
+            "module": "hummingbot.connector.derivative.gate_io_perpetual.gate_io_perpetual_api_order_book_data_source",
+            "class": "GateIoPerpetualAPIOrderBookDataSource"
+        }
+    }
+    
+    def setUp(self):
+        super().setUp()
+        self.client_config_map = MagicMock()
+        # Fix throttler initialization by adding rate_limits_share_pct
+        self.client_config_map.rate_limits_share_pct = Decimal("100")
+        self.trading_pair = "BTC-USDT"
+        
+    async def _reset_udp_manager(self):
+        """Reset the UDP manager singleton for clean tests"""
+        manager = await QtxPerpetualUDPManager.get_instance()
+        if manager._connection_state.is_connected:
+            await manager.stop()
+        
+        manager._subscriptions.clear()
+        manager._index_to_pair.clear()
+        manager._message_queues.clear()
+        
+    def _test_exchange_backend_integration(self, exchange_name: str):
+        """Generic test method for any exchange backend integration"""
+        self.run_async_with_timeout(self._reset_udp_manager())
+        
+        self.client_config_map.derivative_qtx_perpetual_exchange_backend = exchange_name
+        
+        # Mock the parent exchange's order book data source
+        data_source_info = self.EXCHANGE_ORDER_BOOK_DATA_SOURCES[exchange_name]
+        patch_path = f"{data_source_info['module']}.{data_source_info['class']}"
+        
+        with patch(patch_path):
+            # Pass exchange-specific parameters based on the backend
+            init_params = {
+                "client_config_map": self.client_config_map,
+                "qtx_perpetual_host": TEST_UDP_HOST,
+                "qtx_perpetual_port": TEST_UDP_PORT,
+                "exchange_backend": exchange_name,
+                "trading_pairs": [self.trading_pair],
+                "trading_required": False,
+            }
+            
+            # Add exchange-specific mock parameters
+            if exchange_name == "binance":
+                init_params["binance_perpetual_api_key"] = "mock_key"
+                init_params["binance_perpetual_api_secret"] = "mock_secret"
+            elif exchange_name == "okx":
+                init_params["okx_perpetual_api_key"] = "mock_key"
+                init_params["okx_perpetual_secret_key"] = "mock_secret"
+                init_params["okx_perpetual_passphrase"] = "mock_passphrase"
+            elif exchange_name == "bitget":
+                init_params["bitget_perpetual_api_key"] = "mock_key"
+                init_params["bitget_perpetual_secret_key"] = "mock_secret"
+                init_params["bitget_perpetual_passphrase"] = "mock_passphrase"
+            elif exchange_name == "bybit":
+                init_params["bybit_perpetual_api_key"] = "mock_key"
+                init_params["bybit_perpetual_secret_key"] = "mock_secret"
+            elif exchange_name == "kucoin":
+                init_params["kucoin_perpetual_api_key"] = "mock_key"
+                init_params["kucoin_perpetual_secret_key"] = "mock_secret"
+                init_params["kucoin_perpetual_passphrase"] = "mock_passphrase"
+            elif exchange_name == "gate_io":
+                init_params["gate_io_perpetual_api_key"] = "mock_key"
+                init_params["gate_io_perpetual_secret_key"] = "mock_secret"
+                init_params["gate_io_perpetual_user_id"] = "mock_user_id"
+            
+            connector = QtxPerpetualDerivative(**init_params)
+            
+            # Verify correct parent class
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[exchange_name]
+            module = importlib.import_module(exchange_info["module"])
+            parent_class = getattr(module, exchange_info["class"])
+            
+            self.assertIsInstance(connector, parent_class)
+            self.assertEqual(connector.name, "qtx_perpetual")
+            
+            # Verify the connector has the correct exchange backend set
+            self.assertEqual(connector._exchange_backend, exchange_name)
+            
+            # Verify QTX-specific methods exist
+            self.assertTrue(hasattr(connector, "_setup_qtx_market_data"))
+            self.assertTrue(hasattr(connector, "_setup_qtx_udp_subscriptions"))
+            self.assertTrue(hasattr(connector, "_consume_diff_messages"))
+            self.assertTrue(hasattr(connector, "_consume_trade_messages"))
+            
+    def test_binance_backend_integration(self):
+        """Test integration with Binance as parent exchange"""
+        self._test_exchange_backend_integration("binance")
+        
+    def test_okx_backend_integration(self):
+        """Test integration with OKX as parent exchange"""
+        self._test_exchange_backend_integration("okx")
+        
+    def test_bitget_backend_integration(self):
+        """Test integration with Bitget as parent exchange"""
+        self._test_exchange_backend_integration("bitget")
+        
+    def test_bybit_backend_integration(self):
+        """Test integration with Bybit as parent exchange"""
+        self._test_exchange_backend_integration("bybit")
+        
+    def test_kucoin_backend_integration(self):
+        """Test integration with KuCoin as parent exchange"""
+        self._test_exchange_backend_integration("kucoin")
+        
+    def test_gate_io_backend_integration(self):
+        """Test integration with Gate.io as parent exchange"""
+        self._test_exchange_backend_integration("gate_io")
+        
+    def test_all_exchanges_have_correct_qtx_name_mapping(self):
+        """Test that all exchanges have the correct QTX name mapping"""
+        expected_mappings = {
+            "binance": "binance-futures",
+            "okx": "okx-futures",
+            "bitget": "bitget-futures",
+            "bybit": "bybit-futures",
+            "kucoin": "kucoin-futures",
+            "gate_io": "gate-io-futures",
+        }
+        
+        for exchange, expected_qtx_name in expected_mappings.items():
+            exchange_info = EXCHANGE_CONNECTOR_CLASSES[exchange]
+            self.assertEqual(
+                exchange_info["exchange_name_on_qtx"], 
+                expected_qtx_name,
+                f"Exchange {exchange} has incorrect QTX name mapping"
+            )
+            
+    async def test_exchange_specific_subscription_formats(self):
+        """Test that each exchange generates the correct subscription format"""
+        self.run_async_with_timeout(self._reset_udp_manager())
+        
+        for exchange_name in ["binance", "okx", "bitget", "bybit", "kucoin", "gate_io"]:
+            # Create mock socket for this test
+            mock_socket = MockUDPSocket()
+            
+            with patch('socket.socket', return_value=mock_socket):
+                # Create connector for this exchange
+                init_params = {
+                    "client_config_map": self.client_config_map,
+                    "qtx_perpetual_host": TEST_UDP_HOST,
+                    "qtx_perpetual_port": TEST_UDP_PORT,
+                    "exchange_backend": exchange_name,
+                    "trading_pairs": [self.trading_pair],
+                    "trading_required": False,
+                }
+                
+                connector = QtxPerpetualDerivative(**init_params)
+                
+                # Initialize UDP manager
+                await connector._init_udp_manager()
+                udp_manager = connector.udp_manager
+                
+                # Verify the exchange name is set correctly
+                exchange_info = EXCHANGE_CONNECTOR_CLASSES[exchange_name]
+                self.assertEqual(udp_manager._exchange_name, exchange_info["exchange_name_on_qtx"])
+                
+                # Start and subscribe
+                await udp_manager.start()
+                await connector._setup_qtx_udp_subscriptions()
+                
+                # Verify the subscription format
+                expected_symbol = f"{exchange_info['exchange_name_on_qtx']}:{self.trading_pair.lower().replace('-', '')}"
+                sent_symbols = [data[0].decode() for data in mock_socket.sent_data if data[0] != b"ping"]
+                self.assertIn(expected_symbol, sent_symbols, 
+                             f"Exchange {exchange_name} did not send correct subscription format")
+            
+            # Reset UDP manager for next iteration
+            await self._reset_udp_manager()
 
 
 if __name__ == "__main__":
+    import unittest
     unittest.main()

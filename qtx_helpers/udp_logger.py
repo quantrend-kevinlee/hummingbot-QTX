@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-qtx_enhanced_udp_logger.py
+udp_logger.py
 
 Enhanced standalone script to connect to a QTX UDP feed, subscribe to symbols, receive and log messages.
 Features:
@@ -10,11 +10,14 @@ Features:
 - Supports both time duration and max message count limits
 - Detailed statistics per message type
 
-Usage: python qtx_enhanced_udp_logger.py --host 172.30.2.221 --port 8080 --duration 5.0 --max-messages 100 --symbols binance-futures:ethusdt,binance-futures:btcusdt
+Usage: python udp_logger.py
+Default settings: connects to 172.30.3.142:8080, subscribes to kucoin-futures:XBTUSDTM, runs for 300s
 """
 import argparse
 import logging
+import os
 import socket
+import statistics
 import struct
 import sys
 import time
@@ -36,10 +39,25 @@ class Subscription:
     message_count: int = 0
     last_sequence: int = 0
     message_types: dict = None
+    ticker_latencies: list = None
+    depth_latencies: list = None
+    trade_latencies: list = None
+    last_sequences_by_type: dict = None
+    missed_sequences_by_type: dict = None
 
     def __post_init__(self):
         if self.message_types is None:
             self.message_types = defaultdict(int)
+        if self.ticker_latencies is None:
+            self.ticker_latencies = []
+        if self.depth_latencies is None:
+            self.depth_latencies = []
+        if self.trade_latencies is None:
+            self.trade_latencies = []
+        if self.last_sequences_by_type is None:
+            self.last_sequences_by_type = defaultdict(int)
+        if self.missed_sequences_by_type is None:
+            self.missed_sequences_by_type = defaultdict(int)
 
 
 def print_status(subscriptions_list):
@@ -73,6 +91,20 @@ def print_message_stats(subscriptions_list):
             logging.info(f"  Type {msg_type} ({type_name}): {count} messages")
             total_by_type[msg_type] += count
 
+        # Print missed sequences by type for this symbol
+        if sub.missed_sequences_by_type:
+            logging.info("  Missed sequences by type:")
+            for msg_type, missed in sub.missed_sequences_by_type.items():
+                type_name = "UNKNOWN"
+                if abs(msg_type) == 1:
+                    type_name = "TICKER (BID)" if msg_type > 0 else "TICKER (ASK)"
+                elif msg_type == 2:
+                    type_name = "DEPTH"
+                elif abs(msg_type) == 3:
+                    type_name = "TRADE (BUY)" if msg_type > 0 else "TRADE (SELL)"
+                
+                logging.info(f"    Type {msg_type} ({type_name}): {missed} missed")
+
         logging.info("")
 
     # Print totals across all symbols
@@ -92,6 +124,71 @@ def print_message_stats(subscriptions_list):
         logging.info(f"Type {msg_type} ({type_name}): {count} messages")
 
     logging.info("==============================")
+
+
+def calculate_latency_stats(latencies):
+    """Calculate latency statistics for a list of latencies"""
+    if not latencies:
+        return None
+    
+    avg_latency_ms = sum(latencies) / len(latencies)
+    median_latency_ms = statistics.median(latencies)
+    p1_latency_ms = statistics.quantiles(latencies, n=100)[0]   # 1st percentile
+    p25_latency_ms = statistics.quantiles(latencies, n=4)[0]    # 25th percentile (Q1)
+    p75_latency_ms = statistics.quantiles(latencies, n=4)[2]    # 75th percentile (Q3)
+    p99_latency_ms = statistics.quantiles(latencies, n=100)[98] # 99th percentile
+    
+    return {
+        'count': len(latencies),
+        'avg': avg_latency_ms,
+        'median': median_latency_ms,
+        'p1': p1_latency_ms,
+        'p25': p25_latency_ms,
+        'p75': p75_latency_ms,
+        'p99': p99_latency_ms
+    }
+
+
+def print_latency_stats(stats, label):
+    """Print formatted latency statistics"""
+    if stats:
+        logging.info(
+            f"{label} ({stats['count']} messages) - "
+            f"Avg: {stats['avg']:.2f}ms, Median: {stats['median']:.2f}ms, "
+            f"1%: {stats['p1']:.2f}ms, 25%: {stats['p25']:.2f}ms, "
+            f"75%: {stats['p75']:.2f}ms, 99%: {stats['p99']:.2f}ms"
+        )
+    else:
+        logging.info(f"{label}: No messages received")
+
+
+def print_per_symbol_latency_stats(subscriptions_list):
+    """Print latency statistics for each symbol"""
+    logging.info("\n=== Per-Symbol Latency Statistics ===")
+    
+    for sub in subscriptions_list:
+        logging.info(f"\nSymbol: {sub.symbol}")
+        
+        # Calculate overall latency for this symbol
+        all_latencies = []
+        all_latencies.extend(sub.ticker_latencies)
+        all_latencies.extend(sub.depth_latencies)
+        all_latencies.extend(sub.trade_latencies)
+        
+        if all_latencies:
+            overall_stats = calculate_latency_stats(all_latencies)
+            print_latency_stats(overall_stats, f"  Overall for {sub.symbol}")
+        
+        # Print per-type latencies for this symbol
+        ticker_stats = calculate_latency_stats(sub.ticker_latencies)
+        depth_stats = calculate_latency_stats(sub.depth_latencies)
+        trade_stats = calculate_latency_stats(sub.trade_latencies)
+        
+        print_latency_stats(ticker_stats, f"  TICKER for {sub.symbol}")
+        print_latency_stats(depth_stats, f"  DEPTH for {sub.symbol}")
+        print_latency_stats(trade_stats, f"  TRADE for {sub.symbol}")
+    
+    logging.info("\n===============================================")
 
 
 def parse_depth_message(data, offset=56):
@@ -132,20 +229,20 @@ def format_price_levels(levels, max_levels=5):
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced QTX UDP Feed Logger")
-    parser.add_argument("--host", type=str, default="172.30.2.221", help="QTX UDP host IP address")
+    parser.add_argument("--host", type=str, default="172.30.3.142", help="QTX UDP host IP address")
     parser.add_argument("--port", type=int, default=8080, help="QTX UDP port")
     parser.add_argument(
-        "--duration", type=float, default=5.0, help="Duration in seconds to capture data (0 for unlimited)"
+        "--duration", type=float, default=300.0, help="Duration in seconds to capture data (0 for unlimited)"
     )
     parser.add_argument(
-        "--max-messages", type=int, default=10, help="Maximum number of messages to capture (0 for unlimited)"
+        "--max-messages", type=int, default=100, help="Maximum number of messages to capture (0 for unlimited)"
     )
     parser.add_argument("--buffer", type=int, default=UDP_SIZE, help="UDP receive buffer size")
-    parser.add_argument("--output", type=str, default="./qtx_udp_feed.log", help="Path to output log file")
+    parser.add_argument("--output", type=str, default="./logs/udp_logger.log", help="Path to output log file")
     parser.add_argument(
         "--symbols",
         type=str,
-        default="binance-futures:ethusdt",
+        default="binance-futures:btcusdt",
         help="Comma-separated list of symbols to subscribe to",
     )
     parser.add_argument(
@@ -155,11 +252,19 @@ def main():
         help="Minimum number of successful symbol subscriptions required to continue",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging (including raw hex dumps)")
+    parser.add_argument(
+        "--local-port",
+        type=int,
+        default=8088,
+        help="Local UDP port to bind (0 = choose a random free port)",
+    )
     args = parser.parse_args()
 
     # Configure logging
     handlers = [logging.StreamHandler()]
     if args.output:
+        if not os.path.exists(os.path.dirname(args.output)):
+            os.makedirs(os.path.dirname(args.output))
         handlers.append(logging.FileHandler(args.output, mode="w"))
     logging.basicConfig(
         level=logging.INFO,
@@ -180,7 +285,7 @@ def main():
     sock.settimeout(2.0)  # Set timeout for subscription responses
 
     # Bind to any address on an automatic port
-    sock.bind(("0.0.0.0", 0))
+    sock.bind(("0.0.0.0", args.local_port))
     local_addr = sock.getsockname()
     logging.info(f"Bound to local address: {local_addr[0]}:{local_addr[1]}")
 
@@ -284,6 +389,11 @@ def main():
     # Tracking statistics
     missed_sequences = defaultdict(int)
     latencies = []
+    
+    # Tracking latencies by message type
+    ticker_latencies = []  # Type ±1
+    depth_latencies = []   # Type 2
+    trade_latencies = []   # Type ±3
 
     logging.info("\nEntering main loop to receive market data...")
 
@@ -322,23 +432,37 @@ def main():
                                 sub.message_count += 1
                                 sub.message_types[msg_type] += 1
 
-                                # Calculate latency
-                                now = time.time_ns()
-                                latency_ns = now - local_ns
-                                latencies.append(latency_ns)
+                                # Calculate latency (end-to-end from KuCoin server to client)
+                                now_ms = time.time() * 1000  # Current time in milliseconds
+                                latency_ms = now_ms - event_ms  # True end-to-end latency
+                                latencies.append(latency_ms)
+                                
+                                # Track latency by message type (overall and per-symbol)
+                                if abs(msg_type) == 1:  # TICKER
+                                    ticker_latencies.append(latency_ms)
+                                    sub.ticker_latencies.append(latency_ms)
+                                elif msg_type == 2:  # DEPTH
+                                    depth_latencies.append(latency_ms)
+                                    sub.depth_latencies.append(latency_ms)
+                                elif abs(msg_type) == 3:  # TRADE
+                                    trade_latencies.append(latency_ms)
+                                    sub.trade_latencies.append(latency_ms)
 
-                                # Check for missing sequence numbers
-                                if sub.last_sequence > 0 and seq_num > sub.last_sequence + 1:
-                                    gap = seq_num - sub.last_sequence - 1
+                                # Check for missing sequence numbers per message type
+                                last_seq_for_type = sub.last_sequences_by_type[msg_type]
+                                if last_seq_for_type > 0 and seq_num > last_seq_for_type + 1:
+                                    gap = seq_num - last_seq_for_type - 1
+                                    sub.missed_sequences_by_type[msg_type] += gap
                                     missed_sequences[symbol] += gap
                                     logging.warning(
-                                        f"Sequence gap for {symbol}: last={sub.last_sequence}, current={seq_num}, missed={gap}"
+                                        f"Sequence gap for {symbol} type {msg_type}: last={last_seq_for_type}, current={seq_num}, missed={gap}"
                                     )
 
+                                sub.last_sequences_by_type[msg_type] = seq_num
                                 sub.last_sequence = seq_num
 
                                 # Process message based on type
-                                msg_info = f"#{total_messages} [{symbol}] type={msg_type}, seq={seq_num}, latency={latency_ns / 1000000:.2f}ms"
+                                msg_info = f"#{total_messages} [{symbol}] type={msg_type}, seq={seq_num}, latency={latency_ms:.2f}ms"
 
                                 if msg_type == 2:  # Depth
                                     if len(data) >= 56:  # Has additional header
@@ -408,18 +532,28 @@ def main():
         logging.info(f"\nRun completed in {elapsed:.2f} seconds")
         logging.info(f"Total messages received: {total_messages}")
 
-        # Calculate average latency
+        # Calculate and print overall latency statistics
         if latencies:
-            avg_latency_ms = sum(latencies) / len(latencies) / 1000000
-            min_latency_ms = min(latencies) / 1000000
-            max_latency_ms = max(latencies) / 1000000
-            logging.info(
-                f"Latency (ms) - Avg: {avg_latency_ms:.2f}, Min: {min_latency_ms:.2f}, Max: {max_latency_ms:.2f}"
-            )
+            overall_stats = calculate_latency_stats(latencies)
+            print_latency_stats(overall_stats, "Overall Latency")
+
+        # Calculate and print overall latency statistics by message type
+        logging.info("\n=== Overall Latency Statistics by Message Type ===")
+        ticker_stats = calculate_latency_stats(ticker_latencies)
+        depth_stats = calculate_latency_stats(depth_latencies)
+        trade_stats = calculate_latency_stats(trade_latencies)
+        
+        print_latency_stats(ticker_stats, "TICKER Messages (All Symbols)")
+        print_latency_stats(depth_stats, "DEPTH Messages (All Symbols)")
+        print_latency_stats(trade_stats, "TRADE Messages (All Symbols)")
+        logging.info("===============================================")
+
+        # Print per-symbol latency statistics
+        print_per_symbol_latency_stats(subscriptions_list)
 
         # Print missed sequences
         if missed_sequences:
-            logging.info("\nMissed sequences by symbol:")
+            logging.info("\nTotal missed sequences by symbol:")
             for symbol, count in missed_sequences.items():
                 logging.info(f"  {symbol}: {count} missed messages")
 

@@ -72,7 +72,7 @@ This tool is valuable for understanding exactly how the protocol works and can h
 
 ```bash
 # Test the QTX UDP feed connection
-python test/hummingbot/connector/derivative/qtx_perpetual/qtx_enhanced_udp_logger.py --host 172.30.2.221 --port 8080 --duration 30 --symbols binance-futures:btcusdt,binance-futures:ethusdt
+python qtx_helpers/qtx_enhanced_udp_logger.py --host 172.30.2.221 --port 8080 --duration 30 --symbols binance-futures:btcusdt,binance-futures:ethusdt
 ```
 
 ### Testing
@@ -124,7 +124,7 @@ python -m unittest test/hummingbot/connector/derivative/qtx_perpetual/test_qtx_p
 - `/hummingbot/connector/derivative/qtx_perpetual/qtx_perpetual_udp_manager.py` - Centralized UDP connection management
 - `/hummingbot/connector/derivative/qtx_perpetual/qtx_perpetual_trading_pair_utils.py` - All methods for trading pair format conversion
 - `/hummingbot/connector/derivative/qtx_perpetual/qtx_perpetual_shm_manager.py` - Shared memory management for the connector
-- `/dynamic_inheritance_architecture.md` - Detailed explanation of the dynamic subclassing architecture
+- `qtx_helpers/dynamic_inheritance_architecture.md` - Detailed explanation of the dynamic subclassing architecture
 - `/test/hummingbot/connector/derivative/qtx_perpetual/` - All test files should be here.
 
 ## Working with the QTX Connector
